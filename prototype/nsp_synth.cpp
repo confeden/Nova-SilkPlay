@@ -194,6 +194,188 @@ float4 PSWarp(VSOut i) : SV_Target {
     return float4(outc, 1.0);
 }
 
+// --------------------------------------------------------- warp laboratory
+// PSWarpLab is PSWarp with instruments, selected by gParamsPad.x (--warp-lab N) with
+// one free parameter in gParamsPad.y (--warp-lab-p F). It exists to find and fix the
+// hard-edged fragments seen on real footage (G50, P21). It is a COPY rather than
+// #ifdefs inside PSWarp so the shipping shader stays byte-identical; mode 99 runs the
+// copy's default path and is compared against PSWarp to show how faithful it is.
+//   maps       1 winning candidate: grey = the field, red/green/blue/yellow = the
+//                four neighbour cells, black = zero, magenta/cyan = A-/B-anchored
+//              2 k, the pair's disagreement   3 bad, the fallback share
+//              4 w, 0 = all A .. 1 = all B     5 |vSel - vBil| / 8 px
+//   ablations  11 no candidate search (the bilinear field everywhere)
+//              12 no occlusion rule (k = 0, so no A/B choice and no fallback)
+//              13 no fallback              14 no neighbour-cell candidates
+//              15 neighbour cells sampled bilinearly instead of by point
+//   selection  16 softmin over candidate COLOURS, sigma = p, no occlusion rule
+//              17 softmin over candidate VECTORS, sigma = p, then the usual rule
+//              18 argmin on a 3x3 aggregated cost
+//              19 all smooth: no candidates, no occlusion rule
+//              20 softmin VECTORS (sigma = p) and no occlusion rule
+//              21 3x3 aggregated cost + softmin VECTORS (sigma = p)
+//              22 softmin over candidate COLOURS, each colour with the occlusion
+//                 rule applied along its own vector (sigma = p), no fallback
+float CandCost9(float2 vpx, float2 uv) {
+    float2 duv = vpx * gInvSize;
+    float c = 0.0;
+    [unroll] for (int y = -1; y <= 1; ++y) {
+        [unroll] for (int x = -1; x <= 1; ++x) {
+            float2 o = float2(float(x) * 2.0 * gInvSize.x, float(y) * 2.0 * gInvSize.y);
+            float3 a = texA.SampleLevel(smpLin, uv + o - duv * gT, 0).rgb;
+            float3 b = texB.SampleLevel(smpLin, uv + o + duv * (1.0 - gT), 0).rgb;
+            float3 e = abs(a - b);
+            c += e.r + e.g + e.b;
+        }
+    }
+    return c / 3.0;  // the 3-tap cost's scale
+}
+
+float4 PSWarpLab(VSOut i) : SV_Target {
+    float lab = gParamsPad.x;
+    float sigma = max(gParamsPad.y, 1e-4);
+    bool abNoCand  = abs(lab - 11.0) < 0.5 || abs(lab - 19.0) < 0.5;
+    bool abNoOcc   = abs(lab - 12.0) < 0.5 || abs(lab - 16.0) < 0.5 || abs(lab - 19.0) < 0.5 || abs(lab - 20.0) < 0.5;
+    bool abNoFall  = abs(lab - 13.0) < 0.5;
+    bool abNoNeigh = abs(lab - 14.0) < 0.5;
+    bool abLinNb   = abs(lab - 15.0) < 0.5;
+    bool selColour = abs(lab - 16.0) < 0.5;
+    bool selVecSm  = abs(lab - 17.0) < 0.5 || abs(lab - 20.0) < 0.5 || abs(lab - 21.0) < 0.5;
+    bool agg9      = abs(lab - 18.0) < 0.5 || abs(lab - 21.0) < 0.5;
+    bool selColOcc = abs(lab - 22.0) < 0.5;
+
+    float2 vBil = mvTex.SampleLevel(smpLin, i.uv, 0);
+    float2 cellUv = gWarpCell * gInvSize;
+
+    // Every candidate with its cost, in PSWarp's order, so the default argmin (first
+    // strict minimum) picks what PSWarp picks.
+    float2 cv[8];
+    float  cc[8];
+    [unroll] for (int z = 0; z < 8; ++z) { cv[z] = vBil; cc[z] = 1e9; }
+    cc[0] = (agg9 ? CandCost9(vBil, i.uv) : CandCost(vBil, i.uv)) * 0.94;
+    if (!abNoCand) {
+        if (!abNoNeigh) {
+            [unroll] for (int n = 0; n < 4; ++n) {
+                float2 off = float2((n & 1) ? 1.0 : -1.0, (n & 2) ? 1.0 : -1.0) * cellUv;
+                float2 cand = abLinNb ? mvTex.SampleLevel(smpLin, i.uv + off, 0)
+                                      : mvTex.SampleLevel(smpPt, i.uv + off, 0);
+                cv[1 + n] = cand;
+                cc[1 + n] = (agg9 ? CandCost9(cand, i.uv) : CandCost(cand, i.uv)) + 0.004 * length(cand - vBil);
+            }
+        }
+        cv[5] = float2(0.0, 0.0);
+        cc[5] = (agg9 ? CandCost9(float2(0.0, 0.0), i.uv) : CandCost(float2(0.0, 0.0), i.uv)) + 0.004 * length(vBil);
+        if (gBidir > 1.5) {
+            [unroll] for (int s = 0; s < 2; ++s) {
+                float2 cand = (s == 0) ? mvATex.SampleLevel(smpLin, i.uv, 0)
+                                       : mvBTex.SampleLevel(smpLin, i.uv, 0);
+                cv[6 + s] = cand;
+                cc[6 + s] = (agg9 ? CandCost9(cand, i.uv) : CandCost(cand, i.uv)) + 0.004 * length(cand - vBil);
+            }
+        }
+    }
+    int won = 0;
+    float cBest = cc[0];
+    [unroll] for (int m = 1; m < 8; ++m) {
+        if (cc[m] < cBest) { cBest = cc[m]; won = m; }
+    }
+    float2 vBest = cv[won];
+
+    if (selColour) {
+        float3 acc = 0.0;
+        float  wsum = 0.0;
+        [unroll] for (int q = 0; q < 8; ++q) {
+            float wq = cc[q] > 1e8 ? 0.0 : exp(-(cc[q] - cBest) / sigma);
+            float2 vq = cv[q] * gInvSize;
+            float3 aq = texA.SampleLevel(smpLin, i.uv - vq * gT, 0).rgb;
+            float3 bq = texB.SampleLevel(smpLin, i.uv + vq * (1.0 - gT), 0).rgb;
+            acc += wq * lerp(aq, bq, gT);
+            wsum += wq;
+        }
+        return float4(acc / max(wsum, 1e-6), 1.0);
+    }
+    if (selColOcc) {
+        float3 acc = 0.0;
+        float  wsum = 0.0;
+        [unroll] for (int q = 0; q < 8; ++q) {
+            float wq = cc[q] > 1e8 ? 0.0 : exp(-(cc[q] - cBest) / sigma);
+            float2 vq = cv[q] * gInvSize;
+            float2 uvAq = i.uv - vq * gT;
+            float2 uvBq = i.uv + vq * (1.0 - gT);
+            float3 aq = texA.SampleLevel(smpLin, uvAq, 0).rgb;
+            float3 bq = texB.SampleLevel(smpLin, uvBq, 0).rgb;
+            float2 vAfq = gBidir > 0.5 ? mvATex.SampleLevel(smpLin, uvAq, 0) : mvTex.SampleLevel(smpLin, uvAq, 0);
+            float2 vBfq = gBidir > 0.5 ? mvBTex.SampleLevel(smpLin, uvBq, 0) : mvTex.SampleLevel(smpLin, uvBq, 0);
+            float  tolq = 0.35 * length(cv[q]) + 1.5;
+            float  cAq = saturate(1.0 - length(vAfq - cv[q]) / tolq);
+            float  cBq = saturate(1.0 - length(vBfq - cv[q]) / tolq);
+            float  kq = saturate((abs(Luma(aq) - Luma(bq)) - 0.05) * 6.0);
+            float  wAq = (1.0 - gT) * (cAq + 0.05);
+            float  wBq = gT * (cBq + 0.05);
+            float  wwq = lerp(gT, wBq / max(wAq + wBq, 1e-5), kq);
+            acc += wq * lerp(aq, bq, wwq);
+            wsum += wq;
+        }
+        return float4(acc / max(wsum, 1e-6), 1.0);
+    }
+    if (selVecSm) {
+        float2 vacc = 0.0;
+        float  wsum = 0.0;
+        [unroll] for (int q = 0; q < 8; ++q) {
+            float wq = cc[q] > 1e8 ? 0.0 : exp(-(cc[q] - cBest) / sigma);
+            vacc += wq * cv[q];
+            wsum += wq;
+        }
+        vBest = vacc / max(wsum, 1e-6);
+    }
+
+    float2 v = vBest * gInvSize;
+    float2 uvA = i.uv - v * gT;
+    float2 uvB = i.uv + v * (1.0 - gT);
+    float3 a = texA.SampleLevel(smpLin, uvA, 0).rgb;
+    float3 b = texB.SampleLevel(smpLin, uvB, 0).rgb;
+
+    float2 vAf = gBidir > 0.5 ? mvATex.SampleLevel(smpLin, uvA, 0)
+                              : mvTex.SampleLevel(smpLin, uvA, 0);
+    float2 vBf = gBidir > 0.5 ? mvBTex.SampleLevel(smpLin, uvB, 0)
+                              : mvTex.SampleLevel(smpLin, uvB, 0);
+    float  tol = 0.35 * length(vBest) + 1.5;
+    float  cA  = saturate(1.0 - length(vAf - vBest) / tol);
+    float  cB  = saturate(1.0 - length(vBf - vBest) / tol);
+
+    float d = abs(Luma(a) - Luma(b));
+    float k = abNoOcc ? 0.0 : saturate((d - 0.05) * 6.0);
+
+    float wA = (1.0 - gT) * (cA + 0.05);
+    float wB = gT * (cB + 0.05);
+    float w  = lerp(gT, wB / max(wA + wB, 1e-5), k);
+    float3 outc = lerp(a, b, w);
+
+    float bad = abNoFall ? 0.0 : k * saturate(1.0 - 2.0 * max(cA, cB));
+    if (bad > 0.01) {
+        float3 a2 = texA.SampleLevel(smpLin, i.uv - vAf * gInvSize * gT, 0).rgb;
+        float3 b2 = texB.SampleLevel(smpLin, i.uv + vBf * gInvSize * (1.0 - gT), 0).rgb;
+        float3 a0 = texA.SampleLevel(smpPt, i.uv, 0).rgb;
+        float3 b0 = texB.SampleLevel(smpPt, i.uv, 0).rgb;
+        float  agree2 = saturate(1.0 - abs(Luma(a2) - Luma(b2)) * 8.0);
+        float3 fallback = lerp(lerp(a0, b0, gT), lerp(a2, b2, gT), agree2);
+        outc = lerp(outc, fallback, bad);
+    }
+
+    if (abs(lab - 1.0) < 0.5) {
+        static const float3 kWon[8] = {
+            float3(0.20, 0.20, 0.20), float3(0.80, 0.02, 0.02), float3(0.02, 0.70, 0.02),
+            float3(0.02, 0.05, 0.90), float3(0.80, 0.70, 0.02), float3(0.00, 0.00, 0.00),
+            float3(0.80, 0.02, 0.80), float3(0.02, 0.70, 0.80)};
+        return float4(kWon[won], 1.0);
+    }
+    if (abs(lab - 2.0) < 0.5) return float4(k.xxx, 1.0);
+    if (abs(lab - 3.0) < 0.5) return float4(bad.xxx, 1.0);
+    if (abs(lab - 4.0) < 0.5) return float4(w.xxx, 1.0);
+    if (abs(lab - 5.0) < 0.5) return float4(saturate(length(vBest - vBil) / 8.0).xxx, 1.0);
+    return float4(outc, 1.0);
+}
+
 // ------------------------------------------------------------- fps readout
 // Plain 5x7 pixel-font text. The font table and the string arrive in the
 // constant buffer, so the glyphs stay readable ASCII art in C++ instead of magic
@@ -752,6 +934,10 @@ struct Synth::Impl {
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> psBlend;
     ComPtr<ID3D11PixelShader> psWarp;
+    // PSWarpLab, compiled on first use of --warp-lab; see the shader for the modes.
+    ComPtr<ID3D11PixelShader> psWarpLab;
+    int warpLab = 0;
+    float warpLabParam = 0.05f;
     ComPtr<ID3D11ComputeShader> csDownsample;
     ComPtr<ID3D11ComputeShader> csMatchCoarse;
     ComPtr<ID3D11ComputeShader> csMatchMid;
@@ -859,6 +1045,8 @@ void Synth::Impl::SetParams(float t, int occModeOverride) {
         p.t = t;
         p.cellPx = static_cast<float>(cellPx);
         p.bidir = static_cast<float>(occModeOverride >= 0 ? occModeOverride : OccModeNow());
+        p.pad[0] = static_cast<float>(warpLab);  // gParamsPad.x; only PSWarpLab reads it
+        p.pad[1] = warpLabParam;                 // gParamsPad.y, the lab's free parameter
         memcpy(m.pData, &p, sizeof(p));
         ctx->Unmap(cbParams.Get(), 0);
     }
@@ -1409,6 +1597,28 @@ void Synth::SetOcclusionMode(int mode) {
 }
 
 int Synth::OcclusionModeActive() const { return impl_->OccModeNow(); }
+
+bool Synth::SetWarpLab(int mode, std::string* err) {
+    Impl& d = *impl_;
+    if (mode != 0 && !d.psWarpLab) {
+        if (!d.device) {
+            if (err) *err = "SetWarpLab before Create()";
+            return false;
+        }
+        ComPtr<ID3DBlob> blob;
+        if (!CompileOne("PSWarpLab", "ps_5_0", &blob, err)) return false;
+        const HRESULT hr = d.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+                                                       nullptr, d.psWarpLab.ReleaseAndGetAddressOf());
+        if (FAILED(hr)) {
+            if (err) *err = "Create shader PSWarpLab failed: " + HrString(hr);
+            return false;
+        }
+    }
+    d.warpLab = mode;
+    return true;
+}
+
+void Synth::SetWarpLabParam(float p) { impl_->warpLabParam = p; }
 const std::string& Synth::OfaReport() const { return impl_->ofa.Report(); }
 
 bool Synth::EnableOfa(UINT gridSize, std::string* err, bool seedHints) {
@@ -1889,7 +2099,7 @@ bool Synth::Warp(ID3D11RenderTargetView* rtv, UINT w, UINT h, ID3D11ShaderResour
     d.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     d.ctx->IASetInputLayout(nullptr);
     d.ctx->VSSetShader(d.vs.Get(), nullptr, 0);
-    d.ctx->PSSetShader(d.psWarp.Get(), nullptr, 0);
+    d.ctx->PSSetShader(d.warpLab != 0 && d.psWarpLab ? d.psWarpLab.Get() : d.psWarp.Get(), nullptr, 0);
     d.ctx->PSSetShaderResources(0, 3, srvs);
     d.ctx->PSSetShaderResources(7, 2, sides);
     d.ctx->PSSetSamplers(0, 2, samplers);

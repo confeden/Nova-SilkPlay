@@ -126,6 +126,8 @@ struct AppOptions {
     bool offlineWarmup = true;
     std::string offlineInject;  // oracle-flow arm: dir of raw f32 fields
     bool   ofaHints = true;     // seed NVOFA with our coarse field (G30); --no-ofa-hints opts out
+    int    warpLab = 0;         // --warp-lab N: PSWarpLab branch maps / ablations (P21)
+    float  warpLabParam = 0.05f;  // --warp-lab-p F
 
     // Development aid: after `dumpAfterSec` of steady playback, write the two
     // source frames and the synthesized in-between frame, then exit.
@@ -171,6 +173,7 @@ void PrintUsage() {
         "  --log-dirty              one line per capture: damage, content test, verdict\n"
         "  --no-badge               no source/output fps readout in the top-right\n"
         "                           corner (needed for a bit-exact passthrough check)\n"
+        "  --warp-lab N             warp laboratory: branch maps / ablations (P21)\n"
         "  --stats-every F          stats line interval in seconds (default 3)\n"
         "  --dump PREFIX            write PREFIX_a/_b/_mc/_blend .ppm after a few\n"
         "                           seconds of playback, then exit (dev aid)\n"
@@ -343,6 +346,10 @@ bool ParseArgs(int argc, char** argv, AppOptions* opt) {
             opt->offlineInject = v;
         } else if (a == "--ofa-hints") {
             opt->ofaHints = true;
+        } else if (a == "--warp-lab" && next(&v)) {
+            opt->warpLab = atoi(v);
+        } else if (a == "--warp-lab-p" && next(&v)) {
+            opt->warpLabParam = static_cast<float>(atof(v));
         } else if (a == "--no-ofa-hints") {
             opt->ofaHints = false;
         } else if (a == "--dump" && next(&v)) {
@@ -926,6 +933,15 @@ bool App::Engage() {
         return false;
     }
     synth_->SetOcclusionMode(opt_.occMode);
+    if (opt_.warpLab != 0) {
+        if (!synth_->SetWarpLab(opt_.warpLab, &err)) {
+            LogErr("warp lab: %s", err.c_str());
+            return false;
+        }
+        synth_->SetWarpLabParam(opt_.warpLabParam);
+        Log("WARP LAB mode %d (p %.4f) - PSWarpLab, not the shipping warp", opt_.warpLab,
+            opt_.warpLabParam);
+    }
     // With the hardware engine the field lands on ITS grid, so the cell size
     // has to follow the flow grid rather than the block-matcher default.
     const UINT cellWanted =
@@ -1801,6 +1817,8 @@ int RunMain(int argc, char** argv) {
         oo.warmup = opt.offlineWarmup;
         oo.injectDir = opt.offlineInject;
         oo.ofaHints = opt.ofaHints;
+        oo.warpLab = opt.warpLab;
+        oo.warpLabParam = opt.warpLabParam;
         const int rc = RunOffline(oo);
         CoUninitialize();
         return rc;

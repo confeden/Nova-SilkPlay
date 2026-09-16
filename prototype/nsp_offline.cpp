@@ -161,6 +161,15 @@ int RunOffline(const OfflineOptions& opt) {
         return 2;
     }
     synth.SetOcclusionMode(opt.occMode);
+    if (opt.warpLab != 0) {
+        if (!synth.SetWarpLab(opt.warpLab, &err)) {
+            LogErr("offline: warp lab: %s", err.c_str());
+            return 2;
+        }
+        synth.SetWarpLabParam(opt.warpLabParam);
+        Log("offline: WARP LAB mode %d (p %.4f) - PSWarpLab, not the shipping warp", opt.warpLab,
+            opt.warpLabParam);
+    }
     const UINT cell = opt.useOfa ? static_cast<UINT>(opt.ofaGrid) : static_cast<UINT>(opt.cellPx);
     if (!synth.Resize(w, h, &err, cell)) {
         LogErr("offline: synth resize failed: %s", err.c_str());

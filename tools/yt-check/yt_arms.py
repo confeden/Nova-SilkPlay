@@ -152,7 +152,7 @@ def run_arm(arm, a, W, H):
         time.sleep(3.0)  # controls fade after fullscreen
         if arm == "ours":
             elog = open(prefix + "_engine.log", "w", encoding="utf-8")
-            engine = subprocess.Popen([yc.ENGINE], cwd=os.path.dirname(yc.ENGINE), stdout=elog,
+            engine = subprocess.Popen([yc.ENGINE] + a.engine_args.split(), cwd=os.path.dirname(yc.ENGINE), stdout=elog,
                                       stderr=subprocess.STDOUT)
             res["shown"] = bool(yc.wait_for(lambda: "overlay shown" in open(prefix + "_engine.log", encoding="utf-8",
                                                                              errors="replace").read(), 30, 0.25))
@@ -227,6 +227,7 @@ def main():
     ap.add_argument("--arms", default="page,ours,ls")
     ap.add_argument("--proxy")
     ap.add_argument("--quality", default="hd1440")
+    ap.add_argument("--engine-args", default="", help="extra silkplay.exe arguments for the ours arm, e.g. '--warp-lab 22 --warp-lab-p 0.1'")
     ap.add_argument("--min-width", type=int, default=2560, help="an arm below this videoWidth is invalid")
     ap.add_argument("--profile")
     a = ap.parse_args()

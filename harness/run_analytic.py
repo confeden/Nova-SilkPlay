@@ -100,12 +100,19 @@ def main():
     arms = []
     for spec in args.arms.split(","):
         parts = spec.split(":")
-        if len(parts) not in (2, 3):
-            print(f"bad arm '{spec}': expected mode:motion[:occ]")
+        if len(parts) < 2 or len(parts) > 4:
+            print(f"bad arm '{spec}': expected mode:motion[:occ][:labN[@p]]")
             return 2
         mode, motion = parts[0], parts[1]
-        occ = parts[2] if len(parts) == 3 else None
-        out_dir = os.path.join(run_dir, "out_" + "_".join(parts))
+        # Optional fields after mode:motion - the occlusion evidence, and a warp-lab
+        # mode (P21) spelled labN or labN@p, e.g. mc:ofa+hints:bidir+cand:lab16@0.05.
+        occ, lab = None, None
+        for extra in parts[2:]:
+            if extra.startswith("lab"):
+                lab = extra[3:]
+            else:
+                occ = extra
+        out_dir = os.path.join(run_dir, "out_" + "_".join(p.replace("@", "_p") for p in parts))
 
         # The ORACLE arm. `oracle:<motion>` runs the same `mc` synthesis but
         # replaces the estimated field with the corpus's TRUE one, written by
@@ -144,6 +151,11 @@ def main():
             cmd += ["--no-ofa-hints"]
         if occ:
             cmd += ["--occ", occ]
+        if lab:
+            lab_mode, _, lab_p = lab.partition("@")
+            cmd += ["--warp-lab", lab_mode]
+            if lab_p:
+                cmd += ["--warp-lab-p", lab_p]
         if inject:
             cmd += ["--offline-inject", os.path.abspath(inject)]
         print("running:", " ".join(cmd[1:]), flush=True)

@@ -35,6 +35,8 @@ struct OfflineOptions {
     int  ofaGrid = 4;
     int  occMode = 2;        // Synth::SetOcclusionMode: 0 self, 1 bidir, 2 bidir+cand
     bool ofaHints = true;    // seed NVOFA's search with our own coarse field (G30)
+    int  warpLab = 0;        // Synth::SetWarpLab: branch maps and ablations (P21)
+    float warpLabParam = 0.05f;
 
     int  repeat = 1;         // run the whole sequence N times and compare hashes
     bool checkEndpoints = false;  // assert mc(t=0)==A and mc(t=1)==B bit-exactly

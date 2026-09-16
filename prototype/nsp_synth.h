@@ -77,6 +77,13 @@ public:
     // fields do not exist, whatever was asked for.
     int OcclusionModeActive() const;
 
+    // The warp laboratory (P21): 0 = the shipping PSWarp; any other value switches
+    // to PSWarpLab in that mode - a branch map or a one-at-a-time ablation, listed
+    // in the shader. 99 runs the lab copy unchanged and must match PSWarp bit for
+    // bit. Compiles the lab shader on first use.
+    bool SetWarpLab(int mode, std::string* err);
+    void SetWarpLabParam(float p);  // the lab's free parameter (a softmin sigma, ...)
+
     // Estimates the motion field between two source frames. Call once per new
     // source frame, not per generated frame.
     bool PrepareMotion(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b);
