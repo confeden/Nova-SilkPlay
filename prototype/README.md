@@ -207,10 +207,24 @@ check.
   coarse level — see G30: without it the matcher locks onto "true motion plus one
   texture period" on anything that repeats along its own direction of travel,
   which is invisible to the matching cost and catastrophic in the interpolated
-  frame. NVOFA has the same defect and no fix yet). Either way the field is
-  re-anchored to the intermediate frame and given the smoothness prior the
-  hardware lacks (G24), then a symmetric warp runs at phase t with per-pixel
-  candidate vectors and the occlusion test below.
+  frame. On NVOFA, hint mode with a zero hint buffer is what keeps A4 right —
+  G54: our own seeds never reached the hardware, and when they do they are
+  worse). Either way the field is re-anchored to the intermediate frame and
+  given the smoothness prior the hardware lacks (G24); on the hardware path a
+  **coherence pass** then lets every cell re-choose its vector from its 5x5
+  neighbourhood by match quality plus a truncated pull towards its neighbours,
+  twice per pair (`--no-field-cohere` turns it off). The symmetric warp at phase
+  t takes eight candidate vectors per pixel and **blends their colours by a
+  softmin over how well each one matches**, each colour with the occlusion test
+  below applied along its own vector. It used to keep only the cheapest
+  candidate, and on real footage that drew hard-edged fragments along every
+  moving edge (G50, P21): near-ties between very different vectors flipped from
+  pixel to pixel. Measured against that version: spurious edges on real 1440p
+  footage -67..-73 %, analytic scenes +1.05 / +4.08 / +3.36 dB (A1 / A3 / A4).
+
+  `--warp-lab N [--warp-lab-p F]` and `--field-lab N [--field-lab-p F]` run the
+  variants P21 compared (the pre-P21 warp is `--warp-lab 99 --no-field-cohere`);
+  `harness/warp_lab.py` scores them on real footage.
 
 ### The occlusion test (`--occ`)
 
@@ -222,9 +236,9 @@ fetches is what produces black holes and grey ghost wings.
 The warp samples a motion field again **at both fetch sites**. Where the pixel
 really travels along the vector used, the field there agrees with it; in a halo
 it does not, and that disagreement decides which single source frame to believe
-instead of averaging both. Where neither side is consistent, one fixed-point step
-re-fetches with the field found at the fetch site, and only if that still
-disagrees does it fall back to the unwarped cross-fade.
+instead of averaging both. (Before P21 a pixel where neither side was consistent
+fell back to a re-fetch and then to the unwarped cross-fade; the softmin over
+candidates replaced that branch.)
 
 *Which* field is sampled is the whole argument, and it is switchable because it
 is a quality claim:
