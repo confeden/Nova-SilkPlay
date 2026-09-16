@@ -1,6 +1,6 @@
 # Nova SilkPlay — project state
 
-Real-time video frame generation (24/30 fps → up to the display refresh, 165 Hz) for browsers and players on NVIDIA RTX 50. Research and architecture done, the measurement spikes are running, and **the browser path exists end to end and generates frames** (`prototype/`).
+Real-time video frame generation (24/30/60 fps → the display refresh, 165 Hz) for browsers and players on NVIDIA RTX 50. The browser path runs end to end on real YouTube (`prototype/`); the work now is the first beta (D30).
 
 ## Status
 | ID | Component | State | Evidence |
@@ -9,56 +9,61 @@ Real-time video frame generation (24/30 fps → up to the display refresh, 165 H
 | S2 | Dev environment | ok | `kb/dev-environment.md` |
 | S3 | Lossless Scaling reference analysis | ok | `kb/lossless-scaling.md` |
 | S4 | Architecture decision | ok | `kb/architecture.md` — 4 designs, 5 judges, 3 red-teams |
-| S6 | Delivery plan to v0.9 | ok | `kb/plan-v09.md` |
-| S7 | Owner directives D-A/D-B/D-C researched | ok | `kb/research/directives-2026-09.md`; corrected N3/N11 |
+| S6 | Delivery plan to v0.9 | ok (written before D30: assumes the extension) | `kb/plan-v09.md` |
+| S7 | Owner directives D-A/D-B/D-C researched | ok | `kb/research/directives-2026-09.md` |
 | S8 | GPU/OS capability probe built and run on the dev GPU | ok | `tools/caps-probe/`, `kb/dev-environment.md` |
-| S9 | Five gaps closed; NVOFA **measured** on GB206 | ok | `kb/research/gaps-closed-2026-09.md`, `tools/ofa-probe/` |
+| S9 | Five gaps closed; NVOFA measured on GB206 | ok | `kb/research/gaps-closed-2026-09.md`, `tools/ofa-probe/` |
 | S10 | S-M2 harness: overlay+WGC probe, Chrome-side CDP driver | ok | `tools/overlay-probe/README.md` |
 | S11 | Owner directive D-D — imperceptibility is a release gate, tray settings | ok | I12, I13, D22 |
 | S12 | **Browser path end to end: WGC → GPU ring → motion per pair → warp per tick → DComp overlay** | ok | `prototype/README.md` |
-| S13 | **Quality harness**: `--offline` replay (G0/G1 pass), per-frame scoring, `--strata`, true occlusion maps | ok | `kb/quality-harness.md` |
-| S14 | **P13-a bidirectional evidence** `--occ`: +1.95 dB off the band, nothing in it (G31) | ok (measured, mixed) | G31 |
-| S15 | **Oracle-flow reference** (`--offline-inject`, arm `oracle:<motion>`), G0 bit-exact | ok | `kb/quality-harness.md` |
-| S16 | **Anti-overfit scenes + `gate.py`**, **`panprobe.py`** (caught N23), **`costscape.py`** | ok | `kb/quality-harness.md` |
-| S17 | **G30 fixed on both motion paths**: refine-before-score (A4 18.25 → 43.74 vs 44.91 oracle), NVOFA external hints ON (18.90 → 38.34) | ok (measured) | G30, N23, G32 |
-| S18 | **Click-through overlay, one z-slot above the browser, occlusion pause with widgets exempt, fullscreen-only attach** (D25-D27) | ok (17/17 + 8/8 live, secondary) | G35, G36, G38 |
-| S19 | **Video-frame test: player-UI recompositions no longer advance the pair** (adversarially reviewed) | ok (test-page `<video>`), YouTube unverified | G37, G40 |
-| S20 | **Competitor arm vs Lossless Scaling: byte-exact display, recorded and scored per stratum** — per generated frame we win A3 (+3 dB) and text-over-motion A4 (+5.4), lose A1 moving (-2.7) | ok (measured, 60 Hz) | `kb/quality-harness.md`, G41-G43, D28 |
-| S21 | **P17 pacing: regularised content timeline + jitter margin + older pair** — held frames 52→30 % (A3), 48→26 % (A4), LS 32/23; A1 still 51 % | ok (measured, 60 Hz) | `kb/quality-harness.md` |
-| S22 | **Tool survey for browser quality**: learned optical flow, once-per-pair visibility, gate tools, NVIDIA video FG — licences and weight provenance verified; NVIDIA VFX SDK 1.3.0 Video Frame Generation found (continuous t) | ok (research, nothing measured) | `kb/research/browser-quality-tools-2026-09.md`, G45, N24 |
-| S23 | **Learned-flow evaluation environment**: CUDA PyTorch venv, five flow repos, seven checkpoint sets; SEA-RAFT loads and is correct to 0.035 px on a synthetic pair | ok (verified) | `kb/dev-environment.md#learned-flow-evaluation-environment-s23-p18` |
-| S24 | **Score nondeterminism localised**: the hint-seeded NVOFA arm only, two discrete outcomes on the masked columns; every proposed CPU-side sync makes it worse | ok (measured) | G49, N25 |
+| S13 | Quality harness: `--offline` replay (G0/G1), per-frame scoring, `--strata`, true occlusion maps | ok | `kb/quality-harness.md` |
+| S14 | P13-a bidirectional evidence `--occ`: +1.95 dB off the band, nothing in it | ok (measured, mixed) | G31 |
+| S15 | Oracle-flow reference (`--offline-inject`, arm `oracle:<motion>`), G0 bit-exact | ok | `kb/quality-harness.md` |
+| S16 | Anti-overfit scenes + `gate.py`, `panprobe.py`, `costscape.py` | ok | `kb/quality-harness.md` |
+| S17 | G30 fixed on both motion paths: refine-before-score, NVOFA external hints ON | ok (measured) | G30, N23, G32 |
+| S18 | Click-through overlay, one z-slot above the browser, occlusion pause with widgets exempt, fullscreen-only attach | ok (17/17 + 8/8 live) | G35, G36, G38 |
+| S19 | Player-UI recompositions do not advance the pair | ok (test page; fullscreen YouTube in S25) | G37, G40 |
+| S20 | Competitor arm vs LS on analytic clips at 60 Hz: ahead per generated frame on A3/A4 | ok (measured) — **overturned on real content by S25** | `kb/quality-harness.md`, G41-G43, D28 |
+| S21 | P17 pacing: regularised content timeline + jitter margin + older pair — held frames at LS's level | ok (measured, 60 Hz) | `kb/quality-harness.md` |
+| S22 | Tool survey: learned flow, visibility, NVIDIA VFX SDK Video Frame Generation | ok (research) | `kb/research/browser-quality-tools-2026-09.md`, G45, N24 |
+| S23 | Learned-flow evaluation environment (CUDA PyTorch venv, SEA-RAFT verified) | ok | `kb/dev-environment.md#learned-flow-evaluation-environment-s23-p18` |
+| S24 | Score nondeterminism localised to the hint-seeded NVOFA arm | ok (measured) | G49, N25 |
+| S25 | **Stage 0, real YouTube fullscreen on the 165 Hz primary**: mechanics solid (source 24.00/60.00 exact, 163-165 out, judder ≤ 0.1 ms, UI refreshes rejected, 0 Chrome drops, engage 1.5 s); **pictures worse than LS** — hard-edged fragments at motion boundaries | ok (measured, 1440p) | `kb/quality-harness.md` (real content), G50, `tools/yt-check/` |
+| S26 | Repository `github.com/confeden/Nova-SilkPlay` (public): sources, tools, docs; data and builds stay local | ok | `.gitignore` |
 | S5 | Remaining spikes S-M3..S-M12 | planned | `directives-2026-09.md#6` |
 
 The KB index at the end is the map. Re-run `tools/caps-probe` and `tools/ofa-probe/*.py` after any driver bump; `kb/dev-environment.md` holds what this machine reports, not what docs claim.
 
 ## Now
-**The prototype runs** (`prototype/README.md` has the detail and the accepted defects): one device for capture, synthesis and presentation, motion once per pair, a symmetric warp with per-pixel candidates, on a DComp overlay sized exactly to the video rect. 23.57 → 165.0 fps on the primary, 60.0 on the 60 Hz secondary (I14), our swapchain on a hardware `OVERLAY` plane. NVOFA is still the default motion source, but only just — see the comparison in `kb/quality-harness.md`.
+**First beta (D30): Chrome only, no browser extension, signed with the owner's local certificate; PotPlayer after it.** Beta gate, all on the 165 Hz primary with 1440p sources: YouTube in Chrome, fullscreen and windowed, 24/30/60 fps, runs 30 min with no crash and no D22 defect; not worse than LS on the analytic matrix at 165 Hz, on real content side by side (`tools/yt-check/yt_arms.py`) and in the owner's blind A/B; protected video skipped; a game pauses generation; autostart and tray settings; a signed installer.
 
-**Quality (detail in `kb/quality-harness.md`).** The oracle-flow reference (S15) showed motion estimation, not synthesis, dominates the error on every scene (8-26 dB), except the occlusion band, where even a perfect field leaves 18.3 dB (G31: cA ~ cB there, so the weight collapses to `w = t`; the fix is a real visibility signal, P14). G30 is fixed on both motion paths (S17, N23 holds the five failed attempts).
+**Where we stand (S25).** The machinery is beta-grade on real YouTube: cadence, pacing, UI-refresh rejection and engage hold at 165 Hz for 24p and 60p, and Chrome drops nothing. The pictures are not: on real 1440p footage our generated frames carry hard-edged fragments along moving edges (G50) where LS is soft and clean. The analytic scenes ranked us ahead (S20) because flat hard-edged layers hide a wrong per-pixel choice inside a mean. Quality work therefore restarts from real content: find the switch that draws those edges (P21) with a measurement that can see them (P22), then cuts (P23), then motion estimation (P18) and visibility (P14).
 
-**Where we stand against Lossless Scaling (S20).** Measured on byte-exact analytic clips at 60 Hz: per generated frame we are ahead on two of three scenes and behind on A1's moving interior; both engines fail the occlusion band alike; pacing is at LS's level since S21. Windows and the pointer no longer break generation (S18: click-through overlay, z-slot, occlusion pause; S19: UI recompositions do not advance the pair). Next is A1's motion estimation (engine field 32.6 dB vs oracle 50.6 vs cross-fade 34.1) — the paused hand-built experiments and the learned-flow arms of P18 through the same harness — then P14 with a full-resolution field (public-source ranking in `kb/quality-harness.md`); 165 Hz and real YouTube are unverified (P15).
-
-**Driver 616.92 changes nothing** (`kb/dev-environment.md`): `caps-probe` is byte-identical to 616.56 and every NVOFA probe agrees with its old record. **The engine is deterministic** — seven serial gate runs and three concurrent ones reproduce the baseline, and `--offline-repeat` passes G1 bit-exactly — **except on the hint-seeded arm** (G49), whose masked columns have a second, better outcome that appears under heavy GPU contention. Our hint-buffer write is not ordered against the OFA's read and the D3D11 NVOFA API has no primitive that can order it; every CPU-side wait tried makes it worse (N25).
+**Engine facts that still hold.** Motion estimation dominates the error on every analytic scene (S15); the occlusion band needs a real visibility signal (G31). Driver 616.92 changes nothing. The engine is deterministic except the hint-seeded NVOFA arm (G49): run NVOFA arms serially, repeat them, report both outcomes (N25). The picture is shown one source period plus a ~4.5 ms margin late (24p ≈ 46 ms), unmeasured against LS.
 
 ## Next
+Beta order. Rows after the divider come after the beta or are blocked.
 | ID | Task | Why / blocked on |
 |---|---|---|
-| P11 | **Auto target + the real video rect and cadence from the page** (extension or CDP) — lifts D27's fullscreen-only rule; `rVFC` frame events would also replace G37's content test | I8, D12, P6 |
-| P15 | **Verify S18/S19 on real YouTube, fullscreen, on the 165 Hz primary with NVOFA** — the classifier's band against real controls, captions and seek previews; the content-test readback under 1440p load; the activation hitch by eye | everything so far ran on the 60 Hz secondary with the test page |
-| P18 | **Learned-flow arms, offline**: SEA-RAFT S/M, NeuFlow v2, GMFlow, MEMFOF (ceiling) and RIFE@t=0.5 fields through `--offline-inject`, extended to full-resolution A/B-anchored fields plus a visibility map; judged by the `gate.py` matrix + R2; only the winner goes to a TensorRT-RTX probe | owner ask: really better than LS in the browser, modern tools welcome. **Environment is in place and verified (S23)** and D29 lifted the weight-licence gate, so the choice is quality and cost alone. The nondeterminism is no longer a blocker but a rule: it belongs to the hint-seeded NVOFA arm alone (G49), so NVOFA arms are run serially and repeated and both outcomes are reported, while every learned arm is unaffected. Blocked only on the harness taking full-resolution A/B-anchored fields plus a visibility map. First finding: SEA-RAFT-M at full 1080p fp32 does not fit in 8 GB |
-| P19 | **NVIDIA VFX SDK 1.3.0 Video Frame Generation as an arm**: cost per mode at 1080p/1440p on the 5060 Ti, quality in the harness, licence and redistribution | **blocked on an NGC entitlement (G46)**. The network 403 is lifted for the browser by the owner's VPN, the NVIDIA account is signed in and in the Developer Program, but the SDK Core and `nvvfxvideoframegeneration` still answer "Subscribe to get access — NVIDIA AI Enterprise": Download disabled, File Browser empty. Owner action: an AI Enterprise entitlement, or the SDK from elsewhere. Note VFG is licensed for commercial/non-commercial use (Open Model License), so only access is in doubt. The appeal (continuous t, shot-change detection) and the risk (a network per generated frame, N5) are unchanged |
-| P14 | **Give the warp a real visibility signal** — cA/cB carry none in the band (G31) and the vector is already right; build a visibility map once per pair (forward splatting, or a source-anchored band swept by t). Ceilings `only_a` 41.13, `only_b` 36.81 | owner priority; NVOFA per-vector cost still unused; ranked options (coverage map, flow uncertainty, depth tie-break, learned occlusion head): `kb/research/browser-quality-tools-2026-09.md#4` |
-| P20 | **Sharper generated frames**: Catmull-Rom colour fetch in `PSWarp` instead of bilinear, judged on the oracle arm + R2 | at 24→165 six of seven shown frames are generated, and a bilinear sub-pixel fetch softens each one |
-| P13 | **Owner priority: match LSFG 3, then beat it** (D28: never its code). (a) → P14; (b) NVOFA done; (c) static-UI masking; (d) competitor arm done (S20); public-source ranking: visibility masks, full-res field, cut detection, overlay guard | quality is the differentiator |
-| P9 | S-M13 — is the NV12→BGRA8 switch visible, can the engage sequence hide it? **Deferred by D23**, owed before release | G17 + D22 |
-| P2 | Remaining spikes S-M3..S-M12 in D20's order (S-M2 done for composition mode, not latency) | four of five blocking conflicts need one measurement each (`directives-2026-09.md#6`) |
-| P3 | Install toolchain (OF SDK headers, Vulkan SDK, vcpkg; CUDA/TensorRT only if a neural gate opens) | G3 |
-| P5 | Prototype the PotPlayer filter path | validates D10 and A/V sync |
-| P6 | Game/GPU-load gate and auto target detection | D3, I1, I2 |
-| P7 | Installer, signing, engine/app versioning | D6, D7, I5 |
-| P8 | Quality harness — gates pass (S13), oracle arm and scene matrix exist (S15, S16). Owed: calibrate M by defect injection, turn the G2 veto on, photographic corpus at 24p | D19's ladder and every tier verdict are unfalsifiable without it |
-
+| P21 | **Remove the hard-edged fragments on real content (G50)**: a debug output colouring each pixel by the warp branch it took (A-only / B-only / re-fetch / cross-fade fallback / candidate index) on a recorded real pair; then continuous weights instead of switches and a spatially coherent candidate choice; recheck against LS with `yt_arms.py` at 1440p | the one measured reason we are below LS; root cause unknown |
+| P22 | **A real-content measurement that sees sparse hard edges**: textured 1440p pairs with ground truth (high-fps footage decimated, or R2 Meridian) and a metric for edges present in the output and in neither source, in the `gate.py` matrix | until then P21 is judged by eye; frame means cannot see 0.x % of pixels |
+| P23 | **Scene cuts**: detect a cut inside the pair and hold instead of interpolating across it | real footage cuts every few seconds; nothing handles it |
+| P18 | **Learned flow once per pair, offline first**: SEA-RAFT S/M, NeuFlow v2, GMFlow, MEMFOF, RIFE@t=0.5 fields through `--offline-inject` (full-res A/B-anchored fields + visibility map); the winner goes to a TensorRT-RTX probe | A1 field 32.6 dB vs oracle 50.6. Env ready (S23); D29 lifts the weight gate; SEA-RAFT-M at 1080p fp32 does not fit 8 GB. Blocked on the harness taking A/B-anchored fields |
+| P14 | **A real visibility signal for the warp** (forward splatting, or a source-anchored band swept by t) | G31; ceilings `only_a` 41.13, `only_b` 36.81; options in `kb/research/browser-quality-tools-2026-09.md#4` |
+| P20 | **Sharper generated frames**: Catmull-Rom colour fetch in `PSWarp` instead of bilinear | at 24→165 six of seven shown frames are generated |
+| P11 | **Video rect, cadence and DRM without an extension (D30)**: windowed rect from dirty regions or UI Automation (lifts D27); cadence stays video-frame test + timeline (I8); L3 DRM from outside the page (tab URL via UI Automation, Chrome's CDM utility process) — unresearched | beta gate: windowed video, protected video skipped (I7) |
+| P6 | Game/GPU-load gate — beta cut: positive game signal first, the target's process tree excluded (N14) | I1, I2, D3 |
+| P7 | Installer (Inno, per-user), autostart, tray settings window, signed with the owner's local certificate (D30) | beta gate; D14's Velopack updater can follow |
+| P15 | Remaining live checks: captions, seek previews and controls over the video; windowed once P11 lands; the engage flicker by eye | S25 covered fullscreen playback only |
+| P24 | **Beta hardening**: 30-min sessions at 24/30/60p, TDR / sleep / lock / monitor-change recovery, then the owner's blind A/B against LS on 1440p YouTube | the last gate item |
+| — | *after the beta, or blocked* | |
+| P5 | PotPlayer path (`NovaSilk.ax`) | after the beta (D30); validates D10 and A/V sync |
+| P19 | NVIDIA VFX SDK Video Frame Generation as an arm | blocked on an NGC AI Enterprise entitlement (G46); licence itself allows use |
+| P13 | Umbrella — match LSFG 3, then beat it (D28): now P21, P22, P23, P14, P18 | quality is the differentiator |
+| P9 | S-M13 — is the NV12→BGRA8 switch at engage visible, can the engage sequence hide it? Deferred by D23 | G17 + D22 |
+| P2 | Remaining spikes S-M3..S-M12 in D20's order | `directives-2026-09.md#6` |
+| P3 | Toolchain: OF SDK headers, Vulkan SDK, vcpkg; CUDA/TensorRT if P18 wins | G3 |
+| P8 | Harness calibration: M by defect injection, the G2 veto on, photographic corpus at 24p | every tier verdict is unfalsifiable without it |
 
 ## Knowledge base
 Map, invariants, decisions, gotchas, negative knowledge and deep-dive files live in
