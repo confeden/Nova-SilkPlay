@@ -37,6 +37,11 @@ struct OfflineOptions {
     bool ofaHints = true;    // seed NVOFA's search with our own coarse field (G30)
     int  warpLab = 0;        // Synth::SetWarpLab: branch maps and ablations (P21)
     float warpLabParam = 0.05f;
+    int   fieldLab = 0;         // Synth::SetFieldLab (P21)
+    bool  fieldCohere = true;   // Synth::SetFieldCohere; --no-field-cohere turns it off
+    bool  gpuTime = false;      // timestamp queries around PrepareMotion/Warp; never in a scored run
+    bool  ofaSeedHints = false; // G54: real seeds in the hint buffer (default: zeros)
+    float fieldLabParam = 0.02f;
 
     int  repeat = 1;         // run the whole sequence N times and compare hashes
     bool checkEndpoints = false;  // assert mc(t=0)==A and mc(t=1)==B bit-exactly

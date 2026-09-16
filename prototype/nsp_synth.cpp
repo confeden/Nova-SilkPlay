@@ -11,12 +11,14 @@
 // where naive implementations produce their worst holes.
 
 #include "nsp_synth.h"
+#include "nsp_image.h"
 
 #include <d3dcompiler.h>
 #include <DirectXPackedVector.h>
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 #include <cstring>
 #include <iterator>
@@ -93,113 +95,105 @@ float CandCost(float2 vpx, float2 uv) {
 }
 
 float4 PSWarp(VSOut i) : SV_Target {
-    // PER-PIXEL VECTOR CHOICE.
+    // At the endpoints the right answer is the source frame itself, exactly (G0).
+    // The soft blend below would reach it only up to float rounding.
+    if (gT <= 0.0) return float4(texA.SampleLevel(smpPt, i.uv, 0).rgb, 1.0);
+    if (gT >= 1.0) return float4(texB.SampleLevel(smpPt, i.uv, 0).rgb, 1.0);
+
+    // PER-PIXEL VECTOR CANDIDATES.
     //
     // A block field is smooth by construction, so at an object boundary the
-    // bilinear value is a blend of two different motions and belongs to neither
-    // — which is exactly where the torn edges and the bitten-out chunks come
-    // from. Rather than trust it, take it as one CANDIDATE among the vectors of
-    // the four neighbouring cells (plus zero, for a background that is not
-    // moving) and let each pixel keep whichever one actually makes the two
-    // source frames agree there. Boundaries then land on a whole vector instead
-    // of an average of two, at the cost of a few texture samples.
+    // bilinear value is a blend of two different motions and belongs to neither.
+    // So the bilinear value is one CANDIDATE among the vectors of the four
+    // neighbouring cells, zero (a background that is not moving) and — with the
+    // bidirectional fields — the A- and B-anchored vectors read at this pixel:
+    // where an object has just uncovered the background, every neighbouring
+    // intermediate cell carries the object's vector while the A-anchored field
+    // still holds the background's.
+    //
+    // SOFT, NOT ARGMIN (P21, G50). Picking the single cheapest candidate per pixel
+    // drew hard-edged fragments on real footage: on fast, blurred texture several
+    // candidates match almost equally well, neighbouring pixels flip between
+    // vectors that differ by many pixels, and the four neighbour-cell candidates
+    // are point samples whose values jump at every cell border — 4-px staircases.
+    // Each candidate now contributes its own colour, weighted by how much worse it
+    // matches than the best one (a softmin, sigma kWarpSigma), so a near-tie
+    // blends instead of tearing. Measured on real 1440p footage with ground truth:
+    // spurious edges -68 %, and the analytic matrix gains on every scene.
+    static const float kWarpSigma = 0.15;
     float2 vBil = mvTex.SampleLevel(smpLin, i.uv, 0);
     float2 cellUv = gWarpCell * gInvSize;
 
-    float2 vBest = vBil;
-    // A small bias in favour of the smooth field: on flat content every
-    // candidate matches equally well and the field is the better answer.
-    float  cBest = CandCost(vBil, i.uv) * 0.94;
-
+    float2 cv[8];
+    float  cc[8];
+    cv[0] = vBil;
+    // A small bias in favour of the smooth field: on flat content every candidate
+    // matches equally well and the field is the better answer.
+    cc[0] = CandCost(vBil, i.uv) * 0.94;
     [unroll] for (int n = 0; n < 4; ++n) {
         float2 off = float2((n & 1) ? 1.0 : -1.0, (n & 2) ? 1.0 : -1.0) * cellUv;
-        float2 cand = mvTex.SampleLevel(smpPt, i.uv + off, 0);
-        float  c = CandCost(cand, i.uv) + 0.004 * length(cand - vBil);
-        if (c < cBest) { cBest = c; vBest = cand; }
+        cv[1 + n] = mvTex.SampleLevel(smpPt, i.uv + off, 0);
+        cc[1 + n] = CandCost(cv[1 + n], i.uv) + 0.004 * length(cv[1 + n] - vBil);
     }
-    {
-        float c = CandCost(float2(0.0, 0.0), i.uv) + 0.004 * length(vBil);
-        if (c < cBest) { cBest = c; vBest = float2(0.0, 0.0); }
-    }
-    // The two anchored fields, read at THIS pixel, are candidates the
-    // intermediate field cannot offer. Where an object has just uncovered the
-    // background, every neighbouring intermediate cell carries the object's
-    // vector — the object swept through here — while the A-anchored field still
-    // holds the background's, because in A this pixel IS background. The
-    // covering case is the mirror of it in B. Those are exactly the pixels the
-    // occlusion test is arbitrating over, and without this it is arbitrating
-    // between two fetches that are both made with the wrong vector.
+    cv[5] = float2(0.0, 0.0);
+    cc[5] = CandCost(cv[5], i.uv) + 0.004 * length(vBil);
+    cv[6] = vBil;
+    cv[7] = vBil;
+    cc[6] = 1e9;
+    cc[7] = 1e9;
     if (gBidir > 1.5) {
-        [unroll] for (int s = 0; s < 2; ++s) {
-            float2 cand = (s == 0) ? mvATex.SampleLevel(smpLin, i.uv, 0)
-                                   : mvBTex.SampleLevel(smpLin, i.uv, 0);
-            float c = CandCost(cand, i.uv) + 0.004 * length(cand - vBil);
-            if (c < cBest) { cBest = c; vBest = cand; }
-        }
+        cv[6] = mvATex.SampleLevel(smpLin, i.uv, 0);
+        cv[7] = mvBTex.SampleLevel(smpLin, i.uv, 0);
+        cc[6] = CandCost(cv[6], i.uv) + 0.004 * length(cv[6] - vBil);
+        cc[7] = CandCost(cv[7], i.uv) + 0.004 * length(cv[7] - vBil);
     }
+    float cMin = cc[0];
+    [unroll] for (int m = 1; m < 8; ++m) cMin = min(cMin, cc[m]);
 
-    float2 v = vBest * gInvSize;
-    float2 uvA = i.uv - v * gT;
-    float2 uvB = i.uv + v * (1.0 - gT);
-    float3 a = texA.SampleLevel(smpLin, uvA, 0).rgb;
-    float3 b = texB.SampleLevel(smpLin, uvB, 0).rgb;
+    float3 acc = 0.0;
+    float  wsum = 0.0;
+    [unroll] for (int q = 0; q < 8; ++q) {
+        float wq = exp(-(cc[q] - cMin) / kWarpSigma);
+        // exp(-9) is invisible in the blend; skipping it saves six samples.
+        if (wq < 1.2e-4) continue;
+        float2 v = cv[q] * gInvSize;
+        float2 uvA = i.uv - v * gT;
+        float2 uvB = i.uv + v * (1.0 - gT);
+        float3 a = texA.SampleLevel(smpLin, uvA, 0).rgb;
+        float3 b = texB.SampleLevel(smpLin, uvB, 0).rgb;
 
-    // OCCLUSION TEST. Even with the best candidate, a pixel in the halo of a
-    // moving object has no correct vector at all: the background it should show
-    // is hidden in one of the two frames. Sampling a field AT the fetch sites
-    // tells that case apart from an ordinary one — where the pixel really
-    // travels along v the field there agrees with v, in the halo it does not —
-    // and decides which single frame to believe instead of averaging both into
-    // a ghost.
-    //
-    // WHICH field is sampled is the whole difference between a halo heuristic
-    // and a real occlusion mask. Reading the intermediate-anchored field twice
-    // asks one texture the same question at two places: it can say "this
-    // trajectory is inconsistent" but not which of the two frames stopped
-    // seeing the pixel, because both answers come from the same estimate. The
-    // A-anchored and B-anchored fields are independent evidence — in a covering
-    // region the A side still tracks the background and the B side does not,
-    // and in a disocclusion it is the other way round — so the two consistency
-    // numbers can actually disagree, which is what makes the choice between the
-    // frames mean something.
-    float2 vAf = gBidir > 0.5 ? mvATex.SampleLevel(smpLin, uvA, 0)
-                              : mvTex.SampleLevel(smpLin, uvA, 0);
-    float2 vBf = gBidir > 0.5 ? mvBTex.SampleLevel(smpLin, uvB, 0)
-                              : mvTex.SampleLevel(smpLin, uvB, 0);
-    float  tol = 0.35 * length(vBest) + 1.5;
-    float  cA  = saturate(1.0 - length(vAf - vBest) / tol);
-    float  cB  = saturate(1.0 - length(vBf - vBest) / tol);
+        // OCCLUSION TEST, along this candidate. A pixel in the halo of a moving
+        // object has no correct vector: the background it should show is hidden
+        // in one of the two frames. Sampling the A- and B-anchored fields AT the
+        // fetch sites tells that case apart — where the pixel really travels along
+        // v the field there agrees with v, in the halo it does not — and the two
+        // are independent evidence, so they can say WHICH frame lost sight of the
+        // pixel and the blend leans on the other one instead of ghosting both.
+        float2 vAf = gBidir > 0.5 ? mvATex.SampleLevel(smpLin, uvA, 0)
+                                  : mvTex.SampleLevel(smpLin, uvA, 0);
+        float2 vBf = gBidir > 0.5 ? mvBTex.SampleLevel(smpLin, uvB, 0)
+                                  : mvTex.SampleLevel(smpLin, uvB, 0);
+        float  tol = 0.35 * length(cv[q]) + 1.5;
+        float  cA  = saturate(1.0 - length(vAf - cv[q]) / tol);
+        float  cB  = saturate(1.0 - length(vBf - cv[q]) / tol);
+        float  k   = saturate((abs(Luma(a) - Luma(b)) - 0.05) * 6.0);  // 0 agree .. 1 not
+        float  wA  = (1.0 - gT) * (cA + 0.05);
+        float  wB  = gT * (cB + 0.05);
+        float  w   = lerp(gT, wB / max(wA + wB, 1e-5), k);
 
-    float d = abs(Luma(a) - Luma(b));
-    float k = saturate((d - 0.05) * 6.0);       // 0 the pair agrees .. 1 it does not
-
-    float wA = (1.0 - gT) * (cA + 0.05);
-    float wB = gT * (cB + 0.05);
-    float w  = lerp(gT, wB / max(wA + wB, 1e-5), k);
-    float3 outc = lerp(a, b, w);
-
-    // Neither side consistent: one fixed-point step with the field found at the
-    // fetch site, then the unwarped cross-fade. It ghosts, but it never invents
-    // geometry.
-    float bad = k * saturate(1.0 - 2.0 * max(cA, cB));
-    if (bad > 0.01) {
-        float3 a2 = texA.SampleLevel(smpLin, i.uv - vAf * gInvSize * gT, 0).rgb;
-        float3 b2 = texB.SampleLevel(smpLin, i.uv + vBf * gInvSize * (1.0 - gT), 0).rgb;
-        float3 a0 = texA.SampleLevel(smpPt, i.uv, 0).rgb;
-        float3 b0 = texB.SampleLevel(smpPt, i.uv, 0).rgb;
-        float  agree2 = saturate(1.0 - abs(Luma(a2) - Luma(b2)) * 8.0);
-        float3 fallback = lerp(lerp(a0, b0, gT), lerp(a2, b2, gT), agree2);
-        outc = lerp(outc, fallback, bad);
+        acc  += wq * lerp(a, b, w);
+        wsum += wq;
     }
-    return float4(outc, 1.0);
+    return float4(acc / max(wsum, 1e-6), 1.0);
 }
 
 // --------------------------------------------------------- warp laboratory
-// PSWarpLab is PSWarp with instruments, selected by gParamsPad.x (--warp-lab N) with
-// one free parameter in gParamsPad.y (--warp-lab-p F). It exists to find and fix the
-// hard-edged fragments seen on real footage (G50, P21). It is a COPY rather than
-// #ifdefs inside PSWarp so the shipping shader stays byte-identical; mode 99 runs the
-// copy's default path and is compared against PSWarp to show how faithful it is.
+// PSWarpLab holds the warp variants P21 compared, selected by gParamsPad.x
+// (--warp-lab N) with one free parameter in gParamsPad.y (--warp-lab-p F). Its
+// DEFAULT path is the PRE-P21 PSWarp (hard argmin, one occlusion rule, fallback), so
+// "--warp-lab 99" reproduces the old shipping warp for before/after comparisons (to
+// three decimals on every metric, not bit-exactly). Mode 22 is what PSWarp ships
+// since P21, with sigma 0.15.
 //   maps       1 winning candidate: grey = the field, red/green/blue/yellow = the
 //                four neighbour cells, black = zero, magenta/cyan = A-/B-anchored
 //              2 k, the pair's disagreement   3 bad, the fallback share
@@ -803,6 +797,59 @@ void CSSmooth(uint3 id : SV_DispatchThreadID) {
     }
     mvOut[id.xy] = float2(xs[4], ys[4]);
 }
+
+// ---------------------------------------------------- field coherence (P21 lab)
+// Once per pair, on the engine's grid: every cell re-chooses its vector from its
+// own neighbourhood, trading how well the two frames match along a candidate
+// (3x3 taps on the /2 luma, anchored like CSFieldFix) against how far that
+// candidate is from its neighbours (truncated L1, so a real motion boundary costs a
+// bounded amount instead of dragging the other side's vector across it).
+// gMcPad = neighbourhood radius (1 or 2), gLambda = smoothness weight per px,
+// gMagCap = truncation in px, gMagPrior > 0.5 = include the data term.
+float CohereScore(float2 centreLvl, float2 vLvl, float2 invSize) {
+    float sad = 0.0;
+    [unroll] for (int wy = -1; wy <= 1; ++wy) {
+        [unroll] for (int wx = -1; wx <= 1; ++wx) {
+            float2 o = float2(wx, wy) * 1.5;
+            float a = lumaA.SampleLevel(smpLin, (centreLvl + o - vLvl * gAnchor + 0.5) * invSize, 0);
+            float b = lumaB.SampleLevel(smpLin, (centreLvl + o + vLvl * (1.0 - gAnchor) + 0.5) * invSize, 0);
+            sad += abs(a - b);
+        }
+    }
+    return sad;
+}
+
+[numthreads(8, 8, 1)]
+void CSFieldCohere(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= gGrid.x || id.y >= gGrid.y) return;
+    float2 centreLvl = ((float2(id.xy) + 0.5) * gCellPx) / gLevelScale;
+    float2 invSize = 1.0 / float2(gLevelSize);
+    int R = gMcPad > 1.5 ? 2 : 1;
+    float2 nb[25];
+    int n = 0;
+    [loop] for (int dy = -2; dy <= 2; ++dy) {
+        [loop] for (int dx = -2; dx <= 2; ++dx) {
+            if (abs(dx) > R || abs(dy) > R) continue;
+            int2 q = clamp(int2(id.xy) + int2(dx, dy), int2(0, 0), int2(gGrid) - 1);
+            nb[n] = mvIn[q];
+            ++n;
+        }
+    }
+    float2 best = mvIn[id.xy];
+    float bestE = 1e30;
+    [loop] for (int k = 0; k < n; ++k) {
+        float e = 0.0;
+        if (gMagPrior > 0.5) e += CohereScore(centreLvl, nb[k] / gLevelScale, invSize);
+        float sm = 0.0;
+        [loop] for (int j = 0; j < n; ++j) {
+            float2 dv = abs(nb[k] - nb[j]);
+            sm += min(dv.x + dv.y, gMagCap);
+        }
+        e += gLambda * sm / float(n);
+        if (e < bestE) { bestE = e; best = nb[k]; }
+    }
+    mvOut[id.xy] = best;
+}
 )HLSL";
 
 struct ParamsCb {
@@ -874,9 +921,16 @@ struct McCb {
     float magPrior = 0.0f;
     float magCap = 0.0f;
     float pad3 = 0.0f;
+    // G54: HLSL puts gHintSize (uint2) at the START of the next register, offset 64,
+    // because it cannot straddle the one component left after gMcPad. Without this
+    // float the C++ side wrote hintW at 60 and the shader read gHintSize.y = 0, so
+    // CSFillHint returned at once and NVOFA's hint buffer stayed all zeros from the
+    // day hints were added.
+    float padAlign = 0.0f;
     UINT hintW = 0, hintH = 0;
     float pad4[2] = {};
 };
+static_assert(offsetof(McCb, hintW) == 64, "McCb must match the HLSL McParams packing (G54)");
 
 bool CompileOne(const char* entry, const char* target, ID3DBlob** blob, std::string* err) {
     ComPtr<ID3DBlob> errors;
@@ -938,6 +992,27 @@ struct Synth::Impl {
     ComPtr<ID3D11PixelShader> psWarpLab;
     int warpLab = 0;
     float warpLabParam = 0.05f;
+    // The field lab (P21): 0 = off; see ApplyFieldLab for the modes.
+    int fieldLab = 0;
+    float fieldLabParam = 0.02f;
+    // P21: the per-pair coherence pass on the warp's field (ON by default,
+    // --no-field-cohere for before/after); a field lab mode replaces it.
+    bool fieldCohere = true;
+    // Offline only: block once after nvOFExecute so the fields do not depend on
+    // how far the GPU got (G53). Live leaves it off.
+    bool syncAfterFlow = false;
+    // G54: NVOFA's external-hint input stays ON with an all-zero buffer by default -
+    // the configuration every "hints" measurement actually ran, because a packing
+    // bug kept CSFillHint from ever writing. Real seeds from our coarse field
+    // (--ofa-seed-hints) measured -3.6 dB on A4 and no gain on real footage, so the
+    // seed pyramid is not even computed unless asked for.
+    bool ofaSeedHints = false;
+    ComPtr<ID3D11Texture2D> flowSyncStaging;
+    void RunCohere(int idx, float anchor, int radius, float lambda, float trunc, bool data, int iters);
+    void ApplyFieldLab(int idx, float anchor, bool side);
+    // DEBUG (env NSP_HASH_FIELDS): short SHA-256 of a texture's contents, via a
+    // blocking staging copy. Only for locating run-to-run divergence.
+    std::string HashTex(ID3D11Texture2D* tex);
     ComPtr<ID3D11ComputeShader> csDownsample;
     ComPtr<ID3D11ComputeShader> csMatchCoarse;
     ComPtr<ID3D11ComputeShader> csMatchMid;
@@ -948,6 +1023,7 @@ struct Synth::Impl {
     ComPtr<ID3D11ComputeShader> csFieldFix;
     ComPtr<ID3D11ComputeShader> csFillHint;
     ComPtr<ID3D11ComputeShader> csCoarseFix;
+    ComPtr<ID3D11ComputeShader> csFieldCohere;
     OfaFlow ofa;
     bool ofaOn = false;
 
@@ -981,7 +1057,8 @@ struct Synth::Impl {
     // anchored field the warp steers by. 3 and 4 are the same motion anchored on
     // A and on B, which only the hardware path can fill and which exist for the
     // occlusion test — a heuristic without them, real evidence with them.
-    static constexpr int kFieldCount = 5;
+    // 0..4 as before; 5 is the field lab's scratch slot (P21).
+    static constexpr int kFieldCount = 6;
     ComPtr<ID3D11Texture2D> mv[kFieldCount];
     ComPtr<ID3D11ShaderResourceView> mvSrv[kFieldCount];
     ComPtr<ID3D11UnorderedAccessView> mvUav[kFieldCount];
@@ -1236,6 +1313,110 @@ void Synth::Impl::RunCoarseFixOn(ID3D11ShaderResourceView* in, ID3D11UnorderedAc
     ctx->CSSetShaderResources(3, 3, noSrv);
 }
 
+void Synth::Impl::RunCohere(int idx, float anchor, int radius, float lambda, float trunc, bool data,
+                            int iters) {
+    const int scratch = kFieldCount - 1;
+    int src = idx;
+    ID3D11SamplerState* samplers[2] = {smpPoint.Get(), smpLinear.Get()};
+    for (int it = 0; it < iters; ++it) {
+        const int dst = (src == idx) ? scratch : idx;
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (SUCCEEDED(ctx->Map(cbMc.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            McCb c{};
+            c.gridW = gridW;
+            c.gridH = gridH;
+            c.levelW = levels[0].w;
+            c.levelH = levels[0].h;
+            c.levelScale = 2.0f;
+            c.useIn = 1;
+            c.cellPx = static_cast<float>(cellPx);
+            c.lambda = lambda;
+            c.anchor = anchor;
+            c.magPrior = data ? 1.0f : 0.0f;
+            c.magCap = trunc;
+            c.pad3 = static_cast<float>(radius);
+            memcpy(m.pData, &c, sizeof(c));
+            ctx->Unmap(cbMc.Get(), 0);
+        }
+        ID3D11ShaderResourceView* srvs[3] = {levels[0].srvA.Get(), levels[0].srvB.Get(), mvSrv[src].Get()};
+        ID3D11UnorderedAccessView* uavs[1] = {mvUav[dst].Get()};
+        ID3D11Buffer* cbs[1] = {cbMc.Get()};
+        ctx->CSSetShader(csFieldCohere.Get(), nullptr, 0);
+        ctx->CSSetSamplers(0, 2, samplers);
+        ctx->CSSetShaderResources(3, 3, srvs);
+        ctx->CSSetConstantBuffers(2, 1, cbs);
+        ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+        ctx->Dispatch(DivUp(gridW, 8), DivUp(gridH, 8), 1);
+        ID3D11UnorderedAccessView* noUav[1] = {nullptr};
+        ctx->CSSetUnorderedAccessViews(0, 1, noUav, nullptr);
+        ID3D11ShaderResourceView* noSrv[3] = {};
+        ctx->CSSetShaderResources(3, 3, noSrv);
+        src = dst;
+    }
+    if (src != idx) ctx->CopyResource(mv[idx].Get(), mv[src].Get());
+}
+
+// Field lab modes (--field-lab N, --field-lab-p = the smoothness weight):
+//   1 cohere the warp's field only, 3x3 neighbourhood, 2 iterations
+//   2 the same with a 5x5 neighbourhood
+//   3 mode 1 on all three fields (intermediate, A- and B-anchored)
+//   4 mode 2 on all three fields
+//   5 5x5 truncated-L1 vector median on all three (no data term)
+//   6 data term only, 5x5 candidates, all three (propagation without smoothness)
+void Synth::Impl::ApplyFieldLab(int idx, float anchor, bool side) {
+    const float p = fieldLabParam;
+    switch (fieldLab) {
+        case 1: if (!side) RunCohere(idx, anchor, 1, p, 8.0f, true, 2); break;
+        case 2: if (!side) RunCohere(idx, anchor, 2, p, 8.0f, true, 2); break;
+        case 3: RunCohere(idx, anchor, 1, p, 8.0f, true, 2); break;
+        case 4: RunCohere(idx, anchor, 2, p, 8.0f, true, 2); break;
+        case 5: RunCohere(idx, anchor, 2, 1.0f, 8.0f, false, 1); break;
+        case 6: RunCohere(idx, anchor, 2, 0.0f, 8.0f, true, 2); break;
+        default: break;
+    }
+}
+
+std::string Synth::Impl::HashTex(ID3D11Texture2D* tex) {
+    if (!tex) return "none";
+    D3D11_TEXTURE2D_DESC td = {};
+    tex->GetDesc(&td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> st;
+    if (FAILED(device->CreateTexture2D(&td, nullptr, st.GetAddressOf()))) return "nostaging";
+    ctx->CopyResource(st.Get(), tex);
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m))) return "nomap";
+    UINT bpp = 4;
+    if (td.Format == DXGI_FORMAT_R8_UNORM) bpp = 1;
+    std::vector<uint8_t> buf;
+    for (UINT y = 0; y < td.Height; ++y) {
+        const auto* row = static_cast<const uint8_t*>(m.pData) + y * m.RowPitch;
+        buf.insert(buf.end(), row, row + td.Width * bpp);
+    }
+    ctx->Unmap(st.Get(), 0);
+    std::string extra;
+    if (td.Format == DXGI_FORMAT_R16G16_FLOAT) {
+        double sum = 0.0;
+        size_t zeros = 0, cells = buf.size() / 4;
+        for (size_t c = 0; c < cells; ++c) {
+            uint16_t hx = static_cast<uint16_t>(buf[c * 4] | (buf[c * 4 + 1] << 8));
+            uint16_t hy = static_cast<uint16_t>(buf[c * 4 + 2] | (buf[c * 4 + 3] << 8));
+            const float vx = HalfToFloat(hx), vy = HalfToFloat(hy);
+            const double mag = std::sqrt(static_cast<double>(vx) * vx + static_cast<double>(vy) * vy);
+            sum += mag;
+            if (mag < 0.01) ++zeros;
+        }
+        char b[64];
+        _snprintf_s(b, sizeof(b), _TRUNCATE, "(|v| %.2f, zero %.0f%%)", cells ? sum / cells : 0.0,
+                    cells ? 100.0 * zeros / cells : 0.0);
+        extra = b;
+    }
+    return Sha256Hex(buf.data(), buf.size()).substr(0, 12) + extra;
+}
+
 void Synth::Impl::RunCoarseFix(int inIdx, int outIdx) {
     RunCoarseFixOn(mvSrv[inIdx].Get(), mvUav[outIdx].Get(), gridW, gridH, cellPx);
 }
@@ -1330,6 +1511,7 @@ bool Synth::Create(ID3D11Device* device, ID3D11DeviceContext* ctx, std::string* 
     if (!build("CSFieldFix", "cs_5_0", csOut(&d.csFieldFix))) return false;
     if (!build("CSFillHint", "cs_5_0", csOut(&d.csFillHint))) return false;
     if (!build("CSCoarseFix", "cs_5_0", csOut(&d.csCoarseFix))) return false;
+    if (!build("CSFieldCohere", "cs_5_0", csOut(&d.csFieldCohere))) return false;
 
     // Point for the 1:1 paths (I13: nothing is scaled), linear for the warped
     // fetches, whose coordinates are genuinely sub-pixel.
@@ -1619,6 +1801,14 @@ bool Synth::SetWarpLab(int mode, std::string* err) {
 }
 
 void Synth::SetWarpLabParam(float p) { impl_->warpLabParam = p; }
+void Synth::SetFieldCohere(bool on) { impl_->fieldCohere = on; }
+void Synth::SetSyncAfterFlow(bool on) { impl_->syncAfterFlow = on; }
+void Synth::SetOfaSeedHints(bool on) { impl_->ofaSeedHints = on; }
+
+void Synth::SetFieldLab(int mode, float p) {
+    impl_->fieldLab = mode;
+    impl_->fieldLabParam = p;
+}
 const std::string& Synth::OfaReport() const { return impl_->ofa.Report(); }
 
 bool Synth::EnableOfa(UINT gridSize, std::string* err, bool seedHints) {
@@ -1793,7 +1983,7 @@ bool Synth::PrepareMotion(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView*
         // answer as an external hint is the only route in. Only the coarse pass
         // and its refinement are run — the mid and fine passes exist to reach
         // sub-pixel accuracy, and NVOFA does that part itself.
-        if (d.ofa.HintsEnabled()) {
+        if (d.ofa.HintsEnabled() && d.ofaSeedHints) {
             for (int lv = 1; lv < kPyramidLevels; ++lv) {
                 d.Downsample(d.levels[lv - 1].srvA.Get(), d.levels[lv], true, true);
                 d.Downsample(d.levels[lv - 1].srvB.Get(), d.levels[lv], false, true);
@@ -1806,6 +1996,44 @@ bool Synth::PrepareMotion(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView*
             d.RunCoarseFixOn(d.seedSrv[0].Get(), d.seedUav[1].Get(), d.seedGridW, d.seedGridH,
                              Impl::kSeedCellPx);
             d.RunFillHint(d.seedSrv[1].Get());
+            // DEBUG (env NSP_HINT_STATS): what the hint buffer NVOFA reads actually holds.
+            static const bool kHintStats = getenv("NSP_HINT_STATS") != nullptr;
+            if (kHintStats && d.ofa.HintUav()) {
+                ComPtr<ID3D11Resource> hres;
+                d.ofa.HintUav()->GetResource(hres.GetAddressOf());
+                ComPtr<ID3D11Texture2D> htex;
+                if (SUCCEEDED(hres.As(&htex))) {
+                    D3D11_TEXTURE2D_DESC td = {};
+                    htex->GetDesc(&td);
+                    UINT fullW = td.Width, fullH = td.Height;
+                    td.Usage = D3D11_USAGE_STAGING;
+                    td.BindFlags = 0;
+                    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                    td.MiscFlags = 0;
+                    ComPtr<ID3D11Texture2D> st;
+                    if (SUCCEEDED(d.device->CreateTexture2D(&td, nullptr, st.GetAddressOf()))) {
+                        d.ctx->CopyResource(st.Get(), htex.Get());
+                        D3D11_MAPPED_SUBRESOURCE m{};
+                        if (SUCCEEDED(d.ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+                            size_t nz = 0, cells = 0;
+                            double sum = 0.0;
+                            for (UINT y = 0; y < fullH; ++y) {
+                                const auto* row = static_cast<const int16_t*>(m.pData) + (y * m.RowPitch) / 2;
+                                for (UINT x = 0; x < fullW; ++x) {
+                                    const int16_t hx = row[x * 2], hy = row[x * 2 + 1];
+                                    if (hx || hy) ++nz;
+                                    sum += std::sqrt(double(hx) * hx + double(hy) * hy) / 32.0;
+                                    ++cells;
+                                }
+                            }
+                            d.ctx->Unmap(st.Get(), 0);
+                            Log("hint buffer %ux%u fmt %d: nonzero %.1f%%, mean |v| %.2f px (seed grid %ux%u, ofa grid %ux%u)",
+                                fullW, fullH, static_cast<int>(td.Format), cells ? 100.0 * nz / cells : 0.0,
+                                cells ? sum / cells : 0.0, d.seedGridW, d.seedGridH, d.ofa.GridW(), d.ofa.GridH());
+                        }
+                    }
+                }
+            }
         }
 
         lumaFull(a, d.ofa.InputPrevUav());
@@ -1853,18 +2081,76 @@ bool Synth::PrepareMotion(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView*
             // lacks (G24) — an unfixed field would make the occlusion test
             // disagree wherever the hardware locked onto the wrong period,
             // which is precisely where it must not.
+            // DEBUG (P21 determinism): NSP_HASH_FIELDS=all|raw|pre|post reads back
+            // and hashes the field at those stages; every readback is also a sync point.
+            static const char* kHashEnv = getenv("NSP_HASH_FIELDS");
+            const std::string hashWhat = kHashEnv ? kHashEnv : "";
+            const bool hRaw = hashWhat == "all" || hashWhat == "raw" || hashWhat == "1";
+            const bool hMid = hashWhat == "all" || hashWhat == "1";
+            const bool hPre = hMid || hashWhat == "pre";
+            const bool hPost = hMid || hashWhat == "post";
+            const bool kHashFields = !hashWhat.empty();
+            std::string hashLog;
             flowToField(d.ofa.FlowFwdSrv(), 0, 1.0f);
+            // G53: without a wait here, which of NVOFA's writes the passes below
+            // see depends on GPU timing — up to 1 code level in a few pixels, run to
+            // run, once the field coherence pass is in. The offline instrument
+            // promises bit-exact identity, so it blocks on one texel of the
+            // converted field (a full readback at this point was measured to remove
+            // the divergence; one right after nvOFExecute only halved it).
+            if (d.syncAfterFlow) {
+                if (!d.flowSyncStaging) {
+                    D3D11_TEXTURE2D_DESC td = {};
+                    d.mv[0]->GetDesc(&td);
+                    td.Width = 1;
+                    td.Height = 1;
+                    td.Usage = D3D11_USAGE_STAGING;
+                    td.BindFlags = 0;
+                    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                    td.MiscFlags = 0;
+                    d.device->CreateTexture2D(&td, nullptr, d.flowSyncStaging.GetAddressOf());
+                }
+                if (d.flowSyncStaging) {
+                    D3D11_BOX box = {0, 0, 0, 1, 1, 1};
+                    d.ctx->CopySubresourceRegion(d.flowSyncStaging.Get(), 0, 0, 0, 0, d.mv[0].Get(), 0, &box);
+                    D3D11_MAPPED_SUBRESOURCE m{};
+                    if (SUCCEEDED(d.ctx->Map(d.flowSyncStaging.Get(), 0, D3D11_MAP_READ, 0, &m)))
+                        d.ctx->Unmap(d.flowSyncStaging.Get(), 0);
+                }
+            }
+            if (hRaw) hashLog += "raw=" + d.HashTex(d.mv[0].Get());
             d.RunFieldFix(0, 1, 0.5f, 0.5f);
+            if (hMid) hashLog += " fix=" + d.HashTex(d.mv[1].Get());
             d.RunSmoothPass(1, 2);
+            if (hPre) hashLog += " pre=" + d.HashTex(d.mv[2].Get());
+            // FIELD COHERENCE (P21, G50). NVOFA's field is incoherent on fast,
+            // blurred texture, and the warp's per-pixel candidates are drawn from
+            // it, so every wrong neighbour is a fragment waiting to happen. Each
+            // cell re-chooses its vector from its 5x5 neighbourhood by how well
+            // the frames match along it plus a truncated-L1 pull towards its
+            // neighbours, twice. Measured: spurious edges on real footage fall by
+            // two thirds together with the soft warp, the analytic matrix gains
+            // 1-3.4 dB on A1/A3/A4, and it costs ~1.2 ms per pair at 1440p.
+            if (d.fieldLab != 0) {
+                d.ApplyFieldLab(2, 0.5f, false);
+            } else if (d.fieldCohere) {
+                d.RunCohere(2, 0.5f, 2, 0.05f, 8.0f, true, 2);
+            }
+            if (kHashFields) {
+                if (hPost) hashLog += " post=" + d.HashTex(d.mv[2].Get());
+                Log("hash %s", hashLog.c_str());
+            }
             d.mvFinal = 2;
 
             const bool wantSides = d.occMode > 0 && d.ofa.FlowBwdSrv() != nullptr;
             if (wantSides) {
                 d.RunFieldFix(0, 1, 0.0f, 0.0f);
                 d.RunSmoothPass(1, 3);
+                if (d.fieldLab != 0) d.ApplyFieldLab(3, 0.0f, true);
                 flowToField(d.ofa.FlowBwdSrv(), 0, -1.0f);
                 d.RunFieldFix(0, 1, 1.0f, 0.0f);
                 d.RunSmoothPass(1, 4);
+                if (d.fieldLab != 0) d.ApplyFieldLab(4, 1.0f, true);
                 d.mvFwd = 3;
                 d.mvBwd = 4;
             } else {

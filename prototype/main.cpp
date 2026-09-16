@@ -128,6 +128,11 @@ struct AppOptions {
     bool   ofaHints = true;     // seed NVOFA with our coarse field (G30); --no-ofa-hints opts out
     int    warpLab = 0;         // --warp-lab N: PSWarpLab branch maps / ablations (P21)
     float  warpLabParam = 0.05f;  // --warp-lab-p F
+    int    fieldLab = 0;          // --field-lab N: per-pair field coherence lab (P21)
+    bool   offlineGpuTime = false;  // --offline-gpu-time
+    bool   fieldCohere = true;      // --no-field-cohere turns P21's field pass off
+    bool   ofaSeedHints = false;    // --ofa-seed-hints: real seeds in NVOFA's hint buffer (G54)
+    float  fieldLabParam = 0.02f; // --field-lab-p F
 
     // Development aid: after `dumpAfterSec` of steady playback, write the two
     // source frames and the synthesized in-between frame, then exit.
@@ -174,6 +179,8 @@ void PrintUsage() {
         "  --no-badge               no source/output fps readout in the top-right\n"
         "                           corner (needed for a bit-exact passthrough check)\n"
         "  --warp-lab N             warp laboratory: branch maps / ablations (P21)\n"
+        "  --field-lab N            per-pair field coherence lab (P21)\n"
+        "  --no-field-cohere        turn off the per-pair field coherence pass (P21)\n"
         "  --stats-every F          stats line interval in seconds (default 3)\n"
         "  --dump PREFIX            write PREFIX_a/_b/_mc/_blend .ppm after a few\n"
         "                           seconds of playback, then exit (dev aid)\n"
@@ -348,6 +355,16 @@ bool ParseArgs(int argc, char** argv, AppOptions* opt) {
             opt->ofaHints = true;
         } else if (a == "--warp-lab" && next(&v)) {
             opt->warpLab = atoi(v);
+        } else if (a == "--ofa-seed-hints") {
+            opt->ofaSeedHints = true;
+        } else if (a == "--no-field-cohere") {
+            opt->fieldCohere = false;
+        } else if (a == "--offline-gpu-time") {
+            opt->offlineGpuTime = true;
+        } else if (a == "--field-lab" && next(&v)) {
+            opt->fieldLab = atoi(v);
+        } else if (a == "--field-lab-p" && next(&v)) {
+            opt->fieldLabParam = static_cast<float>(atof(v));
         } else if (a == "--warp-lab-p" && next(&v)) {
             opt->warpLabParam = static_cast<float>(atof(v));
         } else if (a == "--no-ofa-hints") {
@@ -933,6 +950,13 @@ bool App::Engage() {
         return false;
     }
     synth_->SetOcclusionMode(opt_.occMode);
+    synth_->SetFieldCohere(opt_.fieldCohere);
+    synth_->SetOfaSeedHints(opt_.ofaSeedHints);
+    if (!opt_.fieldCohere) Log("field coherence OFF (--no-field-cohere)");
+    if (opt_.fieldLab != 0) {
+        synth_->SetFieldLab(opt_.fieldLab, opt_.fieldLabParam);
+        Log("FIELD LAB mode %d (p %.4f) - not the shipping field", opt_.fieldLab, opt_.fieldLabParam);
+    }
     if (opt_.warpLab != 0) {
         if (!synth_->SetWarpLab(opt_.warpLab, &err)) {
             LogErr("warp lab: %s", err.c_str());
@@ -1819,6 +1843,11 @@ int RunMain(int argc, char** argv) {
         oo.ofaHints = opt.ofaHints;
         oo.warpLab = opt.warpLab;
         oo.warpLabParam = opt.warpLabParam;
+        oo.fieldLab = opt.fieldLab;
+        oo.gpuTime = opt.offlineGpuTime;
+        oo.fieldCohere = opt.fieldCohere;
+        oo.ofaSeedHints = opt.ofaSeedHints;
+        oo.fieldLabParam = opt.fieldLabParam;
         const int rc = RunOffline(oo);
         CoUninitialize();
         return rc;

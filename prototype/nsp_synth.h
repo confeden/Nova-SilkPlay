@@ -83,6 +83,17 @@ public:
     // bit. Compiles the lab shader on first use.
     bool SetWarpLab(int mode, std::string* err);
     void SetWarpLabParam(float p);  // the lab's free parameter (a softmin sigma, ...)
+    // The field lab (P21): a per-pair coherence pass on the hardware path's fields,
+    // 0 = off. Modes are listed at Synth::Impl::ApplyFieldLab; p is the smoothness weight.
+    void SetFieldLab(int mode, float p);
+    // The per-pair coherence pass on the warp's field (P21). On by default.
+    void SetFieldCohere(bool on);
+    // Block once after the hardware flow executes (G53). The offline instrument
+    // turns it on for bit-exact identity; the live path leaves it off.
+    void SetSyncAfterFlow(bool on);
+    // G54: write our coarse field into NVOFA's hint buffer. Off by default: the
+    // hint input stays on with a zero buffer, which is what measured better.
+    void SetOfaSeedHints(bool on);
 
     // Estimates the motion field between two source frames. Call once per new
     // source frame, not per generated frame.

@@ -30,15 +30,32 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ENGINE = os.path.normpath(os.path.join(HERE, "..", "prototype", "silkplay.exe"))
 
 
-def parse_mode(spec):
-    """'17@0.02' -> (17, 0.02); '0' -> (0, None)."""
-    if "@" in spec:
-        m, p = spec.split("@", 1)
+def parse_one(part):
+    if "@" in part:
+        m, p = part.split("@", 1)
         return int(m), float(p)
-    return int(spec), None
+    return int(part), None
 
 
-def run_mode(frames, out, mode, motion, param=None):
+def parse_mode(spec):
+    """'22@0.1/f3@0.02/sh' -> (22, 0.1, 3, 0.02, ['--ofa-seed-hints']).
+
+    Tokens after the warp mode: fN[@p] = field lab mode, sh = NVOFA hint buffer seeded
+    from our coarse field (G54; default is a zero buffer), nofc = no field coherence pass."""
+    parts = spec.split("/")
+    wm, wp = parse_one(parts[0])
+    fm, fp, extra = 0, None, []
+    for tok in parts[1:]:
+        if tok.startswith("f"):
+            fm, fp = parse_one(tok[1:])
+        elif tok == "sh":
+            extra.append("--ofa-seed-hints")
+        elif tok == "nofc":
+            extra.append("--no-field-cohere")
+    return wm, wp, fm, fp, extra
+
+
+def run_mode(frames, out, mode, motion, param=None, field=0, field_param=None, extra=()):
     if os.path.isdir(out):
         shutil.rmtree(out)
     os.makedirs(out)
@@ -54,6 +71,11 @@ def run_mode(frames, out, mode, motion, param=None):
         cmd += ["--warp-lab", str(mode)]
     if param is not None:
         cmd += ["--warp-lab-p", str(param)]
+    if field:
+        cmd += ["--field-lab", str(field)]
+    if field_param is not None:
+        cmd += ["--field-lab-p", str(field_param)]
+    cmd += list(extra)
     r = subprocess.run(cmd, capture_output=True, text=True)
     shutil.rmtree(src, ignore_errors=True)
     if r.returncode != 0:
@@ -111,13 +133,14 @@ def main():
     maps = [m for m in a.maps.split(",") if m != ""]
     outs = {}
     for spec in modes + maps:
-        m, prm = parse_mode(spec)
-        outs[spec] = run_mode(frames, os.path.join(a.out, "mode" + spec.replace("@", "_p")), m, a.motion, prm)
+        m, prm, fm, fp, extra = parse_mode(spec)
+        name = "mode" + spec.replace("@", "_p").replace("/", "_")
+        outs[spec] = run_mode(frames, os.path.join(a.out, name), m, a.motion, prm, fm, fp, extra)
 
     base = None
     if "0" in outs:
         base = [np.abs(load(p) - load(t)).max(axis=2) for p, t in zip(outs["0"], truths)]
-    print(f"\n{'mode':>9} {'PSNR':>7} {'big px %':>9} {'spur edge':>10} {'spur>24 %':>10} {'big vs mode 0':>22} {'vs mode 0':>10}")
+    print(f"\n{'mode':>16} {'PSNR':>7} {'big px %':>9} {'spur edge':>10} {'spur>24 %':>10} {'big vs mode 0':>22} {'vs mode 0':>10}")
     for m in modes:
         mse, big, fixed, added, same, npx = [], 0, 0, 0, True, 0
         sp_mean, sp_frac = [], []
@@ -140,7 +163,7 @@ def main():
         psnr = 10 * np.log10(255.0 ** 2 / max(np.mean(mse), 1e-9))
         vs = f"-{fixed} / +{added}" if base is not None else ""
         ident = ("identical" if same else "differs") if base is not None else ""
-        print(f"{m:>9} {psnr:7.2f} {100.0 * big / npx:9.4f} {np.mean(sp_mean):10.3f} "
+        print(f"{m:>16} {psnr:7.2f} {100.0 * big / npx:9.4f} {np.mean(sp_mean):10.3f} "
               f"{100.0 * np.mean(sp_frac):10.3f} {vs:>22} {ident:>10}")
 
     if a.pair >= 0 and base is not None:

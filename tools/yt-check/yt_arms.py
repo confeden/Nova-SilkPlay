@@ -63,7 +63,28 @@ def windows_of(pids):
     return found
 
 
-def youtube_hwnd(W, H):
+def monitors():
+    """Physical-pixel rects (x, y, w, h) of every monitor, primary first."""
+    found = []
+    MONITORENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HMONITOR, wt.HDC, ctypes.POINTER(wt.RECT), wt.LPARAM)
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT), ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+
+    def cb(hmon, hdc, lprc, lp):
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        user32.GetMonitorInfoW(hmon, ctypes.byref(mi))
+        r = mi.rcMonitor
+        found.append(((r.left, r.top, r.right - r.left, r.bottom - r.top), bool(mi.dwFlags & 1)))
+        return True
+
+    user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(cb), 0)
+    found.sort(key=lambda m: not m[1])
+    return [m[0] for m in found]
+
+
+def youtube_hwnd(W, H, X=0, Y=0):
     hits = []
 
     def cb(h, _):
@@ -75,7 +96,7 @@ def youtube_hwnd(W, H):
             user32.GetWindowTextW(h, buf, n + 1)
             r = wt.RECT()
             user32.GetWindowRect(h, ctypes.byref(r))
-            if "YouTube" in buf.value and (r.left, r.top, r.right, r.bottom) == (0, 0, W, H):
+            if "YouTube" in buf.value and (r.left, r.top, r.right, r.bottom) == (X, Y, X + W, Y + H):
                 hits.append(h)
         return True
 
@@ -95,7 +116,25 @@ def make_foreground(hwnd):
     return user32.GetForegroundWindow() == hwnd
 
 
-def open_fullscreen(a, W, H):
+def find_youtube_window():
+    hits = []
+
+    def cb(h, _):
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls, 64)
+        if cls.value == "Chrome_WidgetWin_1" and user32.IsWindowVisible(h):
+            n = user32.GetWindowTextLengthW(h)
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(h, buf, n + 1)
+            if "YouTube" in buf.value:
+                hits.append(h)
+        return True
+
+    user32.EnumWindows(ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)(cb), 0)
+    return hits[0] if hits else None
+
+
+def open_fullscreen(a, W, H, X=0, Y=0):
     stale = os.path.join(a.profile, "DevToolsActivePort")
     if os.path.exists(stale):
         os.remove(stale)
@@ -124,13 +163,19 @@ def open_fullscreen(a, W, H):
     cdp.send("Browser.setWindowBounds", {"windowId": win["windowId"],
                                          "bounds": {"left": 120, "top": 120, "width": 1600, "height": 900}})
     time.sleep(1.0)
+    # Put the window on the target monitor in PHYSICAL pixels (CDP bounds are DIPs and
+    # land elsewhere on a scaled desktop); SWP_NOACTIVATE so the owner's focus stays put.
+    yw = yc.wait_for(find_youtube_window, 10)
+    if yw:
+        user32.SetWindowPos(yw, None, X + 80, Y + 80, min(1600, W - 160), min(900, H - 160), 0x0010 | 0x0004)
+        time.sleep(1.0)
     yc.js(cdp, sid, "(() => { if (document.activeElement) document.activeElement.blur(); const p = document.querySelector('#movie_player'); if (p) p.focus(); return true; })()")
     yc.key(cdp, sid, "f", "KeyF", 70)
     if not yc.wait_for(lambda: yc.js(cdp, sid, "!!document.fullscreenElement"), 6):
         raise RuntimeError("could not enter fullscreen")
-    hwnd = yc.wait_for(lambda: youtube_hwnd(W, H), 6)
+    hwnd = yc.wait_for(lambda: youtube_hwnd(W, H, X, Y), 6)
     if not hwnd:
-        raise RuntimeError("the fullscreen YouTube window does not cover the primary exactly")
+        raise RuntimeError(f"the fullscreen YouTube window does not cover monitor {X},{Y} {W}x{H} exactly")
     if not yc.js(cdp, sid, yc.PROBE_JS):
         raise RuntimeError("rVFC probe did not install")
     # Comparisons are only valid at the requested rendition (owner: 1440p sources).
@@ -139,12 +184,12 @@ def open_fullscreen(a, W, H):
     return sess, cdp, sid, hwnd
 
 
-def run_arm(arm, a, W, H):
+def run_arm(arm, a, W, H, X=0, Y=0):
     cw, ch = a.crop
     rect = ((W - cw) // 2, (H - ch) // 2, cw, ch)
     prefix = os.path.join(a.out, f"{a.name}_{arm}")
     res = {"arm": arm}
-    sess, cdp, sid, hwnd = open_fullscreen(a, W, H)
+    sess, cdp, sid, hwnd = open_fullscreen(a, W, H, X, Y)
     engine = None
     ls_on = False
     started_ls = False
@@ -169,7 +214,7 @@ def run_arm(arm, a, W, H):
             chord(yc.VK_CONTROL, yc.VK_MENU, VK_Q)
             ls_on = True
             out_win = yc.wait_for(lambda: [r for _, r in windows_of(pids_of("LosslessScaling.exe"))
-                                           if r == (0, 0, W, H)], 15, 0.25)
+                                           if r == (X, Y, X + W, Y + H)], 15, 0.25)
             res["ls_output_window"] = bool(out_win)
             if not out_win:
                 raise RuntimeError("Lossless Scaling did not put an output window over the primary")
@@ -182,7 +227,7 @@ def run_arm(arm, a, W, H):
         yc.wait_for(lambda: yc.js(cdp, sid, "document.querySelector('video').currentTime") >= a.rec_at,
                     a.rec_at - st["t"] + 30, 0.01)
         res["media_at_record"] = yc.js(cdp, sid, "document.querySelector('video').currentTime")
-        rec = subprocess.run([yc.DDACAP, "--at", f"{W // 2},{H // 2}", "--rect", ",".join(map(str, rect)),
+        rec = subprocess.run([yc.DDACAP, "--at", f"{X + W // 2},{Y + H // 2}", "--rect", ",".join(map(str, rect)),
                               "--seconds", str(a.rec_seconds), "--out", prefix],
                              capture_output=True, text=True, timeout=180)
         res["state_after"] = yc.js(cdp, sid, yc.STATE_JS)
@@ -227,6 +272,7 @@ def main():
     ap.add_argument("--arms", default="page,ours,ls")
     ap.add_argument("--proxy")
     ap.add_argument("--quality", default="hd1440")
+    ap.add_argument("--monitor", type=int, default=1, help="1 = primary, 2 = the next monitor, ...")
     ap.add_argument("--engine-args", default="", help="extra silkplay.exe arguments for the ours arm, e.g. '--warp-lab 22 --warp-lab-p 0.1'")
     ap.add_argument("--min-width", type=int, default=2560, help="an arm below this videoWidth is invalid")
     ap.add_argument("--profile")
@@ -236,12 +282,16 @@ def main():
     a.profile = a.profile or os.path.join(a.out, "chrome_profile")
     if pids_of("silkplay.exe"):
         sys.exit("silkplay.exe is already running; stop it first")
-    W, H = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    mons = monitors()
+    if a.monitor < 1 or a.monitor > len(mons):
+        sys.exit(f"--monitor {a.monitor}: this desktop has {len(mons)} monitors: {mons}")
+    X, Y, W, H = mons[a.monitor - 1]
+    yc.log(f"monitor {a.monitor}: {X},{Y} {W}x{H}")
     results = []
     for arm in a.arms.split(","):
         yc.log(f"{a.name} arm {arm}")
         try:
-            r = run_arm(arm, a, W, H)
+            r = run_arm(arm, a, W, H, X, Y)
             yc.log(f"  {arm}: media {r.get('media_at_record')} size {r['state_after']['w']}x{r['state_after']['h']} "
                    f"rvfc {json.dumps(r['rvfc'])} | dda {json.dumps(r['dda'])}")
         except Exception as exc:  # noqa: BLE001

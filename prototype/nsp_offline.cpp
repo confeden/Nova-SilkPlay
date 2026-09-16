@@ -16,6 +16,42 @@ using Microsoft::WRL::ComPtr;
 namespace nsp {
 namespace {
 
+// GPU time of one call on the D3D11 queue, by timestamp query. OPT-IN
+// (--offline-gpu-time): reading the answer blocks the CPU, and N25 measured that
+// CPU-side waits around nvOFExecute move the hint-seeded arm between its two
+// outcomes, so a timed run is never a scored run. NVOFA executes on its own
+// engine and is NOT inside these numbers; the passes before and after it are.
+class GpuTimer {
+public:
+    bool Create(ID3D11Device* dev) {
+        D3D11_QUERY_DESC qd = {};
+        qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+        if (FAILED(dev->CreateQuery(&qd, disjoint_.ReleaseAndGetAddressOf()))) return false;
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        return SUCCEEDED(dev->CreateQuery(&qd, t0_.ReleaseAndGetAddressOf())) &&
+               SUCCEEDED(dev->CreateQuery(&qd, t1_.ReleaseAndGetAddressOf()));
+    }
+    void Begin(ID3D11DeviceContext* ctx) {
+        ctx->Begin(disjoint_.Get());
+        ctx->End(t0_.Get());
+    }
+    // Milliseconds, or a negative value when the measurement is unusable.
+    double End(ID3D11DeviceContext* ctx) {
+        ctx->End(t1_.Get());
+        ctx->End(disjoint_.Get());
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
+        UINT64 a = 0, b = 0;
+        while (ctx->GetData(disjoint_.Get(), &dj, sizeof(dj), 0) == S_FALSE) Sleep(0);
+        while (ctx->GetData(t0_.Get(), &a, sizeof(a), 0) == S_FALSE) Sleep(0);
+        while (ctx->GetData(t1_.Get(), &b, sizeof(b), 0) == S_FALSE) Sleep(0);
+        if (dj.Disjoint || dj.Frequency == 0 || b < a) return -1.0;
+        return static_cast<double>(b - a) * 1000.0 / static_cast<double>(dj.Frequency);
+    }
+
+private:
+    ComPtr<ID3D11Query> disjoint_, t0_, t1_;
+};
+
 // A source frame on the GPU, in exactly the layout the capture ring uses:
 // B8G8R8A8_TYPELESS viewed as _SRGB, so the shaders see linear light (G21).
 struct GpuFrame {
@@ -161,6 +197,15 @@ int RunOffline(const OfflineOptions& opt) {
         return 2;
     }
     synth.SetOcclusionMode(opt.occMode);
+    synth.SetFieldCohere(opt.fieldCohere);
+    synth.SetSyncAfterFlow(true);
+    synth.SetOfaSeedHints(opt.ofaSeedHints);
+    if (opt.ofaSeedHints) Log("offline: NVOFA hint buffer SEEDED from our coarse field (G54)");
+    if (!opt.fieldCohere) Log("offline: field coherence OFF (--no-field-cohere)");
+    if (opt.fieldLab != 0) {
+        synth.SetFieldLab(opt.fieldLab, opt.fieldLabParam);
+        Log("offline: FIELD LAB mode %d (p %.4f) - not the shipping field", opt.fieldLab, opt.fieldLabParam);
+    }
     if (opt.warpLab != 0) {
         if (!synth.SetWarpLab(opt.warpLab, &err)) {
             LogErr("offline: warp lab: %s", err.c_str());
@@ -267,6 +312,10 @@ int RunOffline(const OfflineOptions& opt) {
     // hash -> the label that produced it, so a repeat run can name what changed.
     std::map<std::string, std::string> firstPass;
     int failures = 0;
+    GpuTimer timer;
+    const bool timing = opt.gpuTime && timer.Create(device.Get());
+    double prepMs = 0.0, warpMs = 0.0;
+    int prepN = 0, warpN = 0;
     const UINT rowBytes = w * 4;
 
     for (int rep = 0; rep < (std::max)(1, opt.repeat); ++rep) {
@@ -284,7 +333,14 @@ int RunOffline(const OfflineOptions& opt) {
             ctx->UpdateSubresource(texA.tex.Get(), 0, nullptr, pixA.data(), rowBytes, 0);
             ctx->UpdateSubresource(texB.tex.Get(), 0, nullptr, pixB.data(), rowBytes, 0);
 
-            if (isMc && opt.injectDir.empty()) synth.PrepareMotion(texA.srv.Get(), texB.srv.Get());
+            if (isMc && opt.injectDir.empty()) {
+                if (timing) timer.Begin(ctx.Get());
+                synth.PrepareMotion(texA.srv.Get(), texB.srv.Get());
+                if (timing) {
+                    const double ms = timer.End(ctx.Get());
+                    if (ms >= 0.0 && i > 0) { prepMs += ms; ++prepN; }
+                }
+            }
 
             // The endpoint identity is DERIVED from the warp shader, not hoped
             // for: at t=0 it fetches A at the identity offset and weights B by
@@ -334,8 +390,13 @@ int RunOffline(const OfflineOptions& opt) {
                     synth.Blend(rtv.Get(), w, h, texA.srv.Get(), texB.srv.Get(),
                                 static_cast<float>(t));
                 } else {
+                    if (timing) timer.Begin(ctx.Get());
                     synth.Warp(rtv.Get(), w, h, texA.srv.Get(), texB.srv.Get(),
                                static_cast<float>(t));
+                    if (timing) {
+                        const double ms = timer.End(ctx.Get());
+                        if (ms >= 0.0 && i > 0) { warpMs += ms; ++warpN; }
+                    }
                 }
 
                 std::vector<uint8_t> out;
@@ -395,6 +456,11 @@ int RunOffline(const OfflineOptions& opt) {
                 firstPass.size());
     }
 
+    if (timing) {
+        Log("offline: GPU time (D3D11 queue, NVOFA's own engine excluded, first pair skipped): "
+            "PrepareMotion %.3f ms per pair over %d, Warp %.3f ms per frame over %d",
+            prepN ? prepMs / prepN : 0.0, prepN, warpN ? warpMs / warpN : 0.0, warpN);
+    }
     fflush(stdout);
     if (failures) {
         LogErr("offline: %d assertion(s) FAILED", failures);

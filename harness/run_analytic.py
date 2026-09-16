@@ -100,16 +100,18 @@ def main():
     arms = []
     for spec in args.arms.split(","):
         parts = spec.split(":")
-        if len(parts) < 2 or len(parts) > 4:
-            print(f"bad arm '{spec}': expected mode:motion[:occ][:labN[@p]]")
+        if len(parts) < 2 or len(parts) > 5:
+            print(f"bad arm '{spec}': expected mode:motion[:occ][:labN[@p]][:fldN[@p]]")
             return 2
         mode, motion = parts[0], parts[1]
         # Optional fields after mode:motion - the occlusion evidence, and a warp-lab
         # mode (P21) spelled labN or labN@p, e.g. mc:ofa+hints:bidir+cand:lab16@0.05.
-        occ, lab = None, None
+        occ, lab, fld = None, None, None
         for extra in parts[2:]:
             if extra.startswith("lab"):
                 lab = extra[3:]
+            elif extra.startswith("fld"):
+                fld = extra[3:]
             else:
                 occ = extra
         out_dir = os.path.join(run_dir, "out_" + "_".join(p.replace("@", "_p") for p in parts))
@@ -138,7 +140,11 @@ def main():
         # field. It is spelled as a motion name rather than a flag so an arm
         # spec still names one configuration completely.
         hints = (motion == "ofa+hints")
-        if hints:
+        # `ofa+seedhints`: the hint buffer filled from our coarse field. Plain
+        # `ofa+hints` keeps the hint input on with a ZERO buffer, which is what every
+        # hint run measured before G54's packing fix and what measured better.
+        seed_hints = (motion == "ofa+seedhints")
+        if hints or seed_hints:
             motion = "ofa"
 
         cmd = [ENGINE, "--offline", in_dir, "--mode", mode, "--motion", motion,
@@ -147,6 +153,8 @@ def main():
         # to opt OUT explicitly or the two arms would measure the same thing.
         if hints:
             cmd += ["--ofa-hints"]
+        elif seed_hints:
+            cmd += ["--ofa-hints", "--ofa-seed-hints"]
         elif motion == "ofa":
             cmd += ["--no-ofa-hints"]
         if occ:
@@ -156,6 +164,11 @@ def main():
             cmd += ["--warp-lab", lab_mode]
             if lab_p:
                 cmd += ["--warp-lab-p", lab_p]
+        if fld:
+            fld_mode, _, fld_p = fld.partition("@")
+            cmd += ["--field-lab", fld_mode]
+            if fld_p:
+                cmd += ["--field-lab-p", fld_p]
         if inject:
             cmd += ["--offline-inject", os.path.abspath(inject)]
         print("running:", " ".join(cmd[1:]), flush=True)
