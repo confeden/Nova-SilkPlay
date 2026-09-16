@@ -1,0 +1,328 @@
+Compiled against SDK version: 0xa000012
+
+=== 1. ADAPTER ===
+  Description: NVIDIA GeForce RTX 5060 Ti
+  VendorId: 0x10de
+  DeviceId: 0x2d04
+  DedicatedVideoMemory: 8274313216
+  SharedSystemMemory: 17133447168
+  LOCAL Memory Info:
+    Budget: 7469006848
+    CurrentUsage: 0
+    AvailableForReservation: 3868721152
+    CurrentReservation: 0
+  NON_LOCAL Memory Info:
+    Budget: 16328140800
+    CurrentUsage: 0
+    AvailableForReservation: 8298288128
+    CurrentReservation: 0
+
+=== 2. OUTPUTS ===
+  Output 0 DeviceName: \\.\DISPLAY1
+    DesktopCoordinates: 0,0 to 2560,1440
+    AttachedToDesktop: 1
+    Rotation: 1
+    BitsPerColor: 10
+    ColorSpace: 0
+    RedPrimary: 0.678711,0.310547
+    GreenPrimary: 0.271484,0.686523
+    BluePrimary: 0.155273,0.046875
+    WhitePoint: 0.313477,0.329102
+    MinLuminance: 0.2465
+    MaxLuminance: 417.712
+    MaxFullFrameLuminance: 391.463
+    Hardware Composition Flags:
+      FULLSCREEN
+      WINDOWED
+  Output 1 DeviceName: \\.\DISPLAY2
+    DesktopCoordinates: 2560,0 to 4480,1080
+    AttachedToDesktop: 1
+    Rotation: 1
+    BitsPerColor: 8
+    ColorSpace: 0
+    RedPrimary: 0.645335,0.335335
+    GreenPrimary: 0.301138,0.634729
+    BluePrimary: 0.147866,0.0608015
+    WhitePoint: 0.312696,0.32898
+    MinLuminance: 0
+    MaxLuminance: 240
+    MaxFullFrameLuminance: 240
+    Hardware Composition Flags:
+      FULLSCREEN
+      WINDOWED
+
+=== 3. D3D11 DEVICE ===
+  D3D11 Feature Level: 0xb000
+  D3D11_FEATURE_D3D11_OPTIONS:
+    OutputMergerLogicOp: 1
+    UAVOnlyRenderingForcedSampleCount: 1
+    DiscardAPIsSeenByDriver: 1
+    FlagsForUpdateAndCopySeenByDriver: 1
+    ClearView: 1
+    CopyWithOverlap: 1
+    ConstantBufferPartialUpdate: 1
+    ConstantBufferOffsetting: 1
+    MapNoOverwriteOnDynamicConstantBuffer: 1
+    MapNoOverwriteOnDynamicBufferSRV: 1
+    MultisampleRTVWithForcedSampleCountOne: 1
+    SAD4ShaderInstructions: 1
+    ExtendedDoublesShaderInstructions: 1
+    ExtendedResourceSharing: 1
+  D3D11_FEATURE_D3D11_OPTIONS2:
+    PSSpecifiedStencilRefSupported: 0
+    TypedUAVLoadAdditionalFormats: 1
+    ROVsSupported: 0
+    ConservativeRasterizationTier: 0
+    TiledResourcesTier: 1
+    MapOnDefaultTextures: 1
+    StandardSwizzle: 0
+    UnifiedMemoryArchitecture: 0
+  D3D11_FEATURE_D3D11_OPTIONS3:
+    VPAndRTArrayIndexFromAnyShaderFeedingRasterizer: 1
+  D3D11_FEATURE_D3D11_OPTIONS4:
+    ExtendedNV12SharedTextureSupported: 1
+  D3D11_FEATURE_D3D11_OPTIONS5:
+    SharedResourceTier: 3
+  *** D3D11_FEATURE_DISPLAYABLE ***
+    DisplayableTexture: 1
+    SharedResourceTier: 3
+    displayable+UAV 2560x1440 B8G8R8A8_UNORM: CreateTexture2D=0x0 CreateUAV=0x0
+    displayable+UAV 2560x1440 R8G8B8A8_UNORM: CreateTexture2D=0x0 CreateUAV=0x0
+    displayable+UAV 2560x1440 R10G10B10A2_UNORM: CreateTexture2D=0x0 CreateUAV=0x0
+    displayable+UAV 2560x1440 R16G16B16A16_FLOAT: CreateTexture2D=0x0 CreateUAV=0x0
+  D3D11_FEATURE_SHADER_MIN_PRECISION_SUPPORT:
+    PixelShaderMinPrecision: 2
+    AllOtherShaderStagesMinPrecision: 2
+  Format B8G8R8A8_UNORM support:
+    TYPED_UNORDERED_ACCESS_VIEW
+    DISPLAY
+    RENDER_TARGET
+    SHADER_SAMPLE
+    FORMAT_SUPPORT2 hr=0x0 bits=0x146c0
+    UAV_TYPED_STORE
+    UAV_TYPED_LOAD
+  Format R8G8B8A8_UNORM support:
+    TYPED_UNORDERED_ACCESS_VIEW
+    DISPLAY
+    RENDER_TARGET
+    SHADER_SAMPLE
+    FORMAT_SUPPORT2 hr=0x0 bits=0x146c0
+    UAV_TYPED_STORE
+    UAV_TYPED_LOAD
+  Format R10G10B10A2_UNORM support:
+    TYPED_UNORDERED_ACCESS_VIEW
+    DISPLAY
+    RENDER_TARGET
+    SHADER_SAMPLE
+    FORMAT_SUPPORT2 hr=0x0 bits=0x146c0
+    UAV_TYPED_STORE
+    UAV_TYPED_LOAD
+  Format R16G16B16A16_FLOAT support:
+    TYPED_UNORDERED_ACCESS_VIEW
+    DISPLAY
+    RENDER_TARGET
+    SHADER_SAMPLE
+    FORMAT_SUPPORT2 hr=0x0 bits=0x146c0
+    UAV_TYPED_STORE
+    UAV_TYPED_LOAD
+  Format R11G11B10_FLOAT support:
+    TYPED_UNORDERED_ACCESS_VIEW
+    RENDER_TARGET
+    SHADER_SAMPLE
+    FORMAT_SUPPORT2 hr=0x0 bits=0x6c0
+    UAV_TYPED_STORE
+    UAV_TYPED_LOAD
+  Format NV12 support:
+    TYPED_UNORDERED_ACCESS_VIEW
+    RENDER_TARGET
+    SHADER_SAMPLE
+    FORMAT_SUPPORT2 hr=0x0 bits=0x14480
+    UAV_TYPED_STORE
+  Format P010 support:
+    TYPED_UNORDERED_ACCESS_VIEW
+    RENDER_TARGET
+    SHADER_SAMPLE
+    FORMAT_SUPPORT2 hr=0x0 bits=0x14480
+    UAV_TYPED_STORE
+
+=== 4. D3D12 DEVICE ===
+  Highest D3D12 Feature Level: 0xc200
+  Highest Shader Model: 0x68
+  D3D12_FEATURE_D3D12_OPTIONS:
+    DoublePrecisionFloatShaderOps: 1
+    OutputMergerLogicOp: 1
+    MinPrecisionSupport: 2
+    TiledResourcesTier: 4
+    ResourceBindingTier: 3
+    PSSpecifiedStencilRefSupported: 0
+    TypedUAVLoadAdditionalFormats: 1
+    ROVsSupported: 1
+    ConservativeRasterizationTier: 3
+    MaxGPUVirtualAddressBitsPerResource: 40
+    StandardSwizzle64KBSupported: 0
+    CrossNodeSharingTier: 0
+    CrossAdapterRowMajorTextureSupported: 0
+    VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation: 1
+    ResourceHeapTier: 2
+  D3D12_FEATURE_D3D12_OPTIONS1:
+    WaveOps: 1
+    WaveLaneCountMin: 32
+    WaveLaneCountMax: 32
+    TotalLaneCount: 4608
+    ExpandedComputeResourceStates: 1
+    Int64ShaderOps: 1
+  D3D12_FEATURE_D3D12_OPTIONS2:
+    DepthBoundsTestSupported: 1
+    ProgrammableSamplePositionsTier: 2
+  D3D12_FEATURE_D3D12_OPTIONS3:
+    CopyQueueTimestampQueriesSupported: 1
+    CastingFullyTypedFormatSupported: 1
+    WriteBufferImmediateSupportFlags: 127
+    ViewInstancingTier: 3
+    BarycentricsSupported: 1
+  D3D12_FEATURE_D3D12_OPTIONS4:
+    MSAA64KBAlignedTextureSupported: 1
+    SharedResourceCompatibilityTier: 2
+    Native16BitShaderOpsSupported: 1
+  D3D12_FEATURE_D3D12_OPTIONS5:
+    SRVOnlyTiledResourceTier3: 1
+    RenderPassesTier: 0
+    RaytracingTier: 12
+  D3D12_FEATURE_D3D12_OPTIONS6:
+    AdditionalShadingRatesSupported: 1
+    PerPrimitiveShadingRateSupportedWithViewportIndexing: 1
+    VariableShadingRateTier: 2
+    ShadingRateImageTileSize: 16
+    BackgroundProcessingSupported: 1
+  D3D12_FEATURE_D3D12_OPTIONS7:
+    MeshShaderTier: 10
+    SamplerFeedbackTier: 90
+  D3D12_FEATURE_D3D12_OPTIONS8:
+    UnalignedBlockTexturesSupported: 1
+  D3D12_FEATURE_D3D12_OPTIONS9:
+    MeshShaderPipelineStatsSupported: 1
+    MeshShaderSupportsFullRangeRenderTargetArrayIndex: 1
+    AtomicInt64OnTypedResourceSupported: 1
+    AtomicInt64OnGroupSharedSupported: 1
+    DerivativesInMeshAndAmplificationShadersSupported: 0
+    WaveMMATier: 0
+  D3D12_FEATURE_D3D12_OPTIONS10:
+    VariableRateShadingSumCombinerSupported: 1
+    MeshShaderPerPrimitiveShadingRateSupported: 1
+  D3D12_FEATURE_D3D12_OPTIONS11:
+    AtomicInt64OnDescriptorHeapResourceSupported: 1
+  D3D12_FEATURE_D3D12_OPTIONS12:
+    MSPrimitivesPipelineStatisticIncludesCulledPrimitives: 1
+    EnhancedBarriersSupported: 1
+    RelaxedFormatCastingSupported: 1
+  D3D12_FEATURE_D3D12_OPTIONS13:
+    UnrestrictedBufferTextureCopyPitchSupported: 1
+    UnrestrictedVertexElementAlignmentSupported: 1
+    InvertedViewportHeightFlipsYSupported: 1
+    InvertedViewportDepthFlipsZSupported: 1
+    TextureCopyBetweenDimensionsSupported: 1
+    AlphaBlendFactorSupported: 1
+  D3D12_FEATURE_D3D12_OPTIONS14:
+    AdvancedTextureOpsSupported: 1
+    WriteableMSAATexturesSupported: 1
+    IndependentFrontAndBackStencilRefMaskSupported: 1
+  D3D12_FEATURE_D3D12_OPTIONS15:
+    TriangleFanSupported: 1
+    DynamicIndexBufferStripCutSupported: 1
+  D3D12_FEATURE_D3D12_OPTIONS16:
+    DynamicDepthBiasSupported: 1
+    GPUUploadHeapSupported: 1
+  D3D12_FEATURE_D3D12_OPTIONS17:
+    NonNormalizedCoordinateSamplersSupported: 1
+    ManualWriteTrackingResourceSupported: 0
+  D3D12_FEATURE_D3D12_OPTIONS18:
+    RenderPassesValid: 1
+  D3D12_FEATURE_D3D12_OPTIONS19:
+    MismatchingOutputDimensionsSupported: 1
+    SupportedSampleCountsWithNoOutputs: 31
+    PointSamplingAddressesNeverRoundUp: 1
+    RasterizerDesc2Supported: 1
+    NarrowQuadrilateralLinesSupported: 1
+    AnisoFilterWithPointMipSupported: 1
+    MaxSamplerDescriptorHeapSize: 4080
+    MaxSamplerDescriptorHeapSizeWithStaticSamplers: 2048
+    MaxViewDescriptorHeapSize: 1000000
+    ComputeOnlyCustomHeapSupported: 0
+  D3D12_FEATURE_D3D12_OPTIONS20:
+    ComputeOnlyWriteWatchSupported: 1
+    RecreateAtTier: 0
+  D3D12_FEATURE_D3D12_OPTIONS21:
+    WorkGraphsTier: 10
+    ExecuteIndirectTier: 11
+    SampleCmpGradientAndBiasSupported: 1
+    ExtendedCommandInfoSupported: 1
+  D3D12_FEATURE_ARCHITECTURE1:
+    NodeIndex: 0
+    TileBasedRenderer: 0
+    UMA: 0
+    CacheCoherentUMA: 0
+    IsolatedMMU: 1
+
+=== 5. D3D12 VIDEO ===
+  QueryInterface ID3D12VideoDevice:  0x0
+  QueryInterface ID3D12VideoDevice1: 0x0
+  QueryInterface ID3D12VideoDevice2: 0x0
+  VIDEO_FEATURE_AREA_SUPPORT: 0x0
+    VideoDecodeSupport:  1
+    VideoProcessSupport: 1
+    VideoEncodeSupport:  1
+  MOTION_ESTIMATOR (NV12): 0x0
+    BlockSizeFlags: 0x3 8X8 16X16
+    PrecisionFlags: 0x1 QUARTER_PEL
+    SizeRange: 32x32 .. 4096x4096
+  MOTION_ESTIMATOR (R8_UNORM): 0x0
+    BlockSizeFlags: 0x0 NONE
+    PrecisionFlags: 0x0 NONE
+    SizeRange: 0x0 .. 0x0
+  MOTION_ESTIMATOR_SIZE (1920x1080): 0x0
+    Protected: 0
+    MotionVectorHeapMemoryPoolL0Size: 2410392
+    MotionVectorHeapMemoryPoolL1Size: 436736
+    MotionEstimatorMemoryPoolL0Size:  428440
+    MotionEstimatorMemoryPoolL1Size:  436736
+  MOTION_ESTIMATOR_SIZE (2560x1440): 0x0
+    Protected: 0
+    MotionVectorHeapMemoryPoolL0Size: 4042136
+    MotionVectorHeapMemoryPoolL1Size: 436736
+    MotionEstimatorMemoryPoolL0Size:  428440
+    MotionEstimatorMemoryPoolL1Size:  436736
+  CreateVideoMotionEstimator: 0x0
+  CreateVideoMotionVectorHeap: 0x0
+
+=== 6. PRESENTATION API ===
+  CreatePresentationFactory export: FOUND
+  DCompositionWaitForCompositorClock: FOUND
+  DCompositionGetStatistics: FOUND
+  DCompositionGetTargetStatistics: FOUND
+  DCompositionGetFrameId: FOUND
+  DCompositionBoostCompositorClock: FOUND
+  D3D11 CreatePresentationFactory: 0x0
+    IsPresentationSupported: 1
+    IsPresentationSupportedWithIndependentFlip: 1
+
+  *** D3D12 PRESENTATION PROBE ***
+  D3D12 CreatePresentationFactory (Device): 0x0
+    IsPresentationSupported: 1
+    IsPresentationSupportedWithIndependentFlip: 1
+  D3D12 CreatePresentationFactory (Queue): 0x80070057
+
+=== 7. NVOFA ===
+  NvOFAPICreateInstanceD3D11: FOUND
+  NvOFAPICreateInstanceD3D12: FOUND
+  NvOFAPICreateInstanceCuda: FOUND
+  NvOFAPICreateInstanceVk: FOUND
+  NvOFGetMaxSupportedApiVersion: FOUND
+  WARNING: Calling NvOFGetMaxSupportedApiVersion with undocumented signature. Might crash.
+  NvOFGetMaxSupportedApiVersion returned status 0x0, version 0x50
+
+=== 8. TIMING ===
+  QueryPerformanceFrequency: 10000000
+  D3D12 Direct Queue TimestampFrequency: 1000000000
+  D3D12 Direct Queue ClockCalibration: GPU=1789543977540440192, CPU=179873562997
+  D3D12 Compute Queue TimestampFrequency: 1000000000
+  D3D12 Compute Queue ClockCalibration: GPU=1789543977554712768, CPU=179873705723

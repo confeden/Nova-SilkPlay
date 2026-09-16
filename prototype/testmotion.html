@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Nova SilkPlay motion source</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// A deterministic low-frame-rate motion source.
+//
+// This stands in for a 24 fps video while the prototype has no player: from the
+// capture's point of view a page that composites a new frame 24 times a second
+// is indistinguishable from a 24 fps <video>, and unlike a video it gives hard
+// edges at a known constant velocity — which is exactly what makes ghosting,
+// judder and a wrong interpolation phase visible to the naked eye.
+//
+//   ?fps=24     source frame rate (default 24)
+//   ?speed=900  bar speed in CSS px/s (default 900)
+//   ?grid=1     add a scrolling stripe field
+//   ?controls=1 overlay YouTube-like player controls
+//   ?still=1500 hold the picture still for this long after every ?move=2000 ms
+//   ?vw=32      with video=record: the picture 32 % of the width, centred
+//   ?video=URL  play a real <video> instead of the canvas (muted, looped); with
+//   ?rate=0.4   its playbackRate, so a 60 fps file presents 24 new frames a second
+const params = new URLSearchParams(location.search);
+const FPS    = Math.max(1, Number(params.get('fps')   || 24));
+const SPEED  = Number(params.get('speed') || 900);
+const GRID   = params.get('grid') !== '0';
+const MOVE_MS  = Number(params.get('move') || 2000);
+const STILL_MS = Number(params.get('still') || 0);
+
+//   ?input=1    count pointer input into the window title, so a program outside
+//               Chrome can tell whether a click over our overlay reached the page:
+//               "Nova SilkPlay motion source | d<down> u<up> m<move> w<wheel>"
+if (params.get('input') === '1') {
+  const n = { d: 0, u: 0, m: 0, w: 0 };
+  const show = () => { document.title = `Nova SilkPlay motion source | d${n.d} u${n.u} m${n.m} w${n.w}`; };
+  addEventListener('pointerdown', () => { n.d++; show(); });
+  addEventListener('pointerup',   () => { n.u++; show(); });
+  addEventListener('pointermove', () => { n.m++; show(); });
+  addEventListener('wheel',       () => { n.w++; show(); }, { passive: true });
+  show();
+}
+
+if (params.get('controls') === '1') {
+  document.head.insertAdjacentHTML('beforeend', `<style>
+    .yt-bar { position: fixed; left: 0; right: 0; opacity: 0; transition: opacity 0.25s linear; pointer-events: none; }
+    .yt-top { top: 0; height: 60px; background: linear-gradient(to bottom, rgba(0,0,0,0.6), rgba(0,0,0,0)); color: #fff; font: 18px sans-serif; display: flex; align-items: center; padding-left: 24px; box-sizing: border-box; }
+    .yt-bot { bottom: 0; height: 90px; background: linear-gradient(to top, rgba(0,0,0,0.75), rgba(0,0,0,0)); }
+    .yt-track { position: absolute; bottom: 52px; left: 12px; right: 12px; height: 4px; background: rgba(255,255,255,0.3); pointer-events: none; }
+    .yt-fill { height: 100%; width: 0%; background: #f00; }
+    .yt-row { position: absolute; bottom: 0; left: 0; right: 0; height: 40px; display: flex; align-items: center; padding: 0 12px; gap: 12px; }
+    .yt-btn { width: 28px; height: 28px; border-radius: 4px; background: rgba(255,255,255,0.85); pointer-events: auto; cursor: pointer; transition: transform 0.1s, background 0.1s; }
+    .yt-btn:hover { background: #fff; transform: scale(1.15); }
+    .yt-time { color: #fff; font: 14px sans-serif; }
+    .yt-flash { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 96px; height: 96px; background: rgba(0,0,0,0.5); border-radius: 50%; pointer-events: none; display: none; }
+    @keyframes yt-flash-anim { 0% { opacity: 1; transform: translate(-50%,-50%) scale(1); } 100% { opacity: 0; transform: translate(-50%,-50%) scale(1.4); } }
+  </style>`);
+  document.body.insertAdjacentHTML('beforeend', `
+    <div class="yt-bar yt-top">Test video title</div>
+    <div class="yt-bar yt-bot">
+      <div class="yt-track"><div class="yt-fill" id="yt-f"></div></div>
+      <div class="yt-row">
+        <div class="yt-btn"></div><div class="yt-btn"></div><div class="yt-btn"></div>
+        <div class="yt-time" id="yt-t">0:00 / 3:45</div>
+      </div>
+    </div>
+    <div class="yt-flash" id="yt-p"></div>`);
+  const [topBar, botBar] = document.querySelectorAll('.yt-bar');
+  const fill = document.getElementById('yt-f'), timeLabel = document.getElementById('yt-t'), flash = document.getElementById('yt-p');
+  let hideTimer = null, updateInterval = null;
+  const updateTime = () => {
+    const t = (performance.now() / 1000) % 225;
+    fill.style.width = `${(t / 225) * 100}%`;
+    const s = Math.floor(t);
+    timeLabel.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')} / 3:45`;
+  };
+  window.addEventListener('pointermove', () => {
+    topBar.style.opacity = '1'; botBar.style.opacity = '1';
+    if (!updateInterval) { updateTime(); updateInterval = setInterval(updateTime, 250); }
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {
+      topBar.style.opacity = '0'; botBar.style.opacity = '0';
+      clearInterval(updateInterval); updateInterval = null;
+    }, 2500);
+  });
+  window.addEventListener('pointerdown', () => {
+    flash.style.animation = 'none';
+    void flash.offsetWidth;
+    flash.style.display = 'block';
+    flash.style.animation = 'yt-flash-anim 0.5s forwards';
+  });
+  flash.addEventListener('animationend', () => { flash.style.display = 'none'; });
+}
+
+
+const c = document.getElementById('c');
+const ctx = c.getContext('2d', { alpha: false, desynchronized: false });
+
+let dpr = 1, W = 0, H = 0;
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = Math.round(c.clientWidth  * dpr);
+  H = Math.round(c.clientHeight * dpr);
+  c.width = W; c.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const period = 1000 / FPS;
+let frame = 0;
+let t0 = null;
+let lastDraw = -1e9;
+let drawn = 0, lastReport = 0, shownFps = 0;
+
+function draw(nowMs) {
+  // Content time is derived from the FRAME INDEX, not from the wall clock, so
+  // the motion is exactly uniform even when a redraw lands a millisecond late.
+  // ?move=2000&still=1500 : the picture moves for `move` ms, then holds still for
+  // `still` ms while frames keep coming — a still shot, or animation held on the
+  // same drawing. Only the frame counter at the top keeps changing.
+  let contentFrame = frame;
+  if (STILL_MS > 0) {
+    const moveF = Math.max(1, Math.round(MOVE_MS / period));
+    const cycleF = moveF + Math.max(1, Math.round(STILL_MS / period));
+    contentFrame = Math.floor(frame / cycleF) * moveF + Math.min(frame % cycleF, moveF);
+  }
+  const t = contentFrame * period / 1000;
+  const speed = SPEED * dpr;
+
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  if (GRID) {
+    // Scrolling stripes: a hard-edged field at half the bar's speed.
+    const pitch = 160 * dpr;
+    const off = ((t * speed * 0.5) % pitch + pitch) % pitch;
+    ctx.fillStyle = '#1c3a5e';
+    for (let x = -pitch + off; x < W; x += pitch) ctx.fillRect(x, 0, pitch / 2, H);
+  }
+
+  // The bar. One hard edge is worth a thousand gradients: a cross-fade shows it
+  // as two bars, a motion-compensated frame shows one.
+  const barW = 70 * dpr;
+  const span = W + barW;
+  const x = ((t * speed) % span + span) % span - barW;
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(x, H * 0.12, barW, H * 0.34);
+
+  // A disc on a circular path: rotation and vertical motion, which a purely
+  // horizontal estimator would get wrong.
+  const cx = W * 0.5, cy = H * 0.72, r = Math.min(W, H) * 0.16;
+  const a = t * 1.1 * Math.PI;
+  ctx.beginPath();
+  ctx.arc(cx + Math.cos(a) * r, cy + Math.sin(a) * r, 42 * dpr, 0, Math.PI * 2);
+  ctx.fillStyle = '#ff5a3c';
+  ctx.fill();
+
+  // Frame counter: a dropped or repeated source frame is readable off the screen.
+  ctx.fillStyle = '#e8e8e8';
+  ctx.font = `${Math.round(34 * dpr)}px Consolas, monospace`;
+  ctx.textBaseline = 'top';
+  ctx.fillText(`frame ${String(frame).padStart(6, '0')}   target ${FPS} fps   actual ${shownFps.toFixed(1)} fps   ${W}x${H} @dpr ${dpr}`,
+               20 * dpr, 20 * dpr);
+
+  frame++;
+  drawn++;
+  if (nowMs - lastReport > 1000) {
+    shownFps = drawn * 1000 / (nowMs - lastReport);
+    drawn = 0;
+    lastReport = nowMs;
+  }
+}
+
+function loop(nowMs) {
+  if (t0 === null) { t0 = nowMs; lastReport = nowMs; }
+  // rAF-gated redraw: the page composites at FPS, never faster, and every redraw
+  // is aligned to a vblank exactly as a video frame would be.
+  if (nowMs - lastDraw >= period - 0.5) {
+    lastDraw = nowMs;
+    draw(nowMs);
+  }
+  requestAnimationFrame(loop);
+}
+const VIDEO = params.get('video');
+if (VIDEO === 'record') {
+  // ?video=record&seconds=6 : a real <video> WITH continuous motion and no
+  // download. The canvas animation is recorded to WebM (one encoded frame per
+  // drawn frame, so the timestamps are the draw cadence), then played back
+  // looped through Chrome's actual decoder and video compositing path.
+  const secs = Number(params.get('seconds') || 6);
+  const stream = c.captureStream(0);
+  const track = stream.getVideoTracks()[0];
+  const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 25000000 });
+  const chunks = [];
+  rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    const v = document.createElement('video');
+    v.src = URL.createObjectURL(new Blob(chunks, { type: 'video/webm' }));
+    v.muted = true;
+    v.loop = true;
+    // ?vw=32 : the picture only a third of the window wide and centred, like a
+    // vertical video in a fullscreen player — its own damage covers a third of
+    // the band while a controls fade still damages all of it.
+    const vw = Number(params.get('vw') || 100);
+    v.style.cssText = `position:fixed;left:${(100 - vw) / 2}vw;top:0;width:${vw}vw;height:100vh;object-fit:fill;background:#000`;
+    document.body.insertBefore(v, document.body.firstChild);
+    c.style.display = 'none';
+    recording = false;
+    v.play();
+  };
+  var recording = true;
+  const origDraw = draw;
+  draw = function (nowMs) { origDraw(nowMs); if (recording) track.requestFrame(); };
+  rec.start();
+  // Its own rAF loop: loop() re-arms itself and would keep drawing the hidden
+  // canvas on the main thread for the rest of the run.
+  requestAnimationFrame(function recLoop(nowMs) {
+    if (t0 === null) { t0 = nowMs; lastReport = nowMs; }
+    if (nowMs - lastDraw >= period - 0.5) { lastDraw = nowMs; draw(nowMs); }
+    if (nowMs - t0 < secs * 1000) requestAnimationFrame(recLoop);
+    else rec.stop();
+  });
+} else if (VIDEO) {
+  // A real decoder and Chrome's real video compositing path, which a canvas does
+  // not exercise: the question "is the same video frame recomposited bit-exactly
+  // while the controls fade" can only be answered on a <video>.
+  c.style.display = 'none';
+  const v = document.createElement('video');
+  v.src = VIDEO;
+  v.muted = true;
+  v.loop = true;
+  v.autoplay = true;
+  v.style.cssText = 'position:fixed;left:0;top:0;width:100vw;height:100vh;object-fit:contain;background:#000';
+  document.body.insertBefore(v, document.body.firstChild);
+  v.addEventListener('loadedmetadata', () => { v.playbackRate = Number(params.get('rate') || 1); v.play(); });
+} else {
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

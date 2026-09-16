@@ -1,0 +1,16 @@
+obj/
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# probe output
+*.csv
+*.json
+sm2_samples.csv
+sm2_report.json
+
+# scratch (agent build/verify helpers)
+_*.cmd
+__pycache__/
+testpage.html

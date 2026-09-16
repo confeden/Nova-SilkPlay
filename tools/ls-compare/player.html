@@ -1,0 +1,102 @@
+<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<title>Nova SilkPlay frame player</title>
+<style>*{margin:0;padding:0}html,body{background:#000;overflow:hidden}
+canvas{position:fixed;left:0;top:0;width:100vw;height:100vh}</style>
+</head><body>
+<canvas id="c"></canvas>
+<script>
+const p = new URLSearchParams(location.search);
+const dir   = p.get('dir') || 'frames/A3';
+const n     = parseInt(p.get('n')   || '48',  10);
+const w     = parseInt(p.get('w')   || '960', 10);
+const h     = parseInt(p.get('h')   || '540', 10);
+const fps   = parseFloat(p.get('fps') || '24');
+const hold  = p.has('hold') ? parseInt(p.get('hold'), 10) : null;
+const period = 1000 / fps;
+document.title = 'Nova SilkPlay frame player';
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', {alpha: false, colorSpace: 'srgb'});
+ctx.imageSmoothingEnabled = false;
+window.nsp = {index: 0, drawn: 0};
+
+// Resizing a canvas resets its context state and clears it: re-apply and redraw.
+let shown = null;
+function setSize(pw, ph) {
+  canvas.width = pw; canvas.height = ph;
+  ctx.imageSmoothingEnabled = false;
+  if (shown !== null) draw(shown);
+}
+
+let roOk = false;
+const ro = new ResizeObserver(entries => {
+  for (const e of entries) {
+    let pw, ph;
+    if (e.devicePixelContentBoxSize && e.devicePixelContentBoxSize[0]) {
+      pw = e.devicePixelContentBoxSize[0].inlineSize;
+      ph = e.devicePixelContentBoxSize[0].blockSize;
+      roOk = true;
+    } else {
+      console.warn('devicePixelContentBoxSize unavailable, falling back');
+      pw = Math.round(e.target.clientWidth  * devicePixelRatio);
+      ph = Math.round(e.target.clientHeight * devicePixelRatio);
+    }
+    setSize(pw, ph);
+  }
+});
+ro.observe(canvas, {box: 'device-pixel-content-box'});
+
+const base = dir.endsWith('/') ? dir : dir + '/';
+const imgs = [], bitmaps = [];
+let loaded = 0, failed = false;
+
+function drawLoading(i) {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#888'; ctx.font = '16px monospace';
+  ctx.fillText(`loading ${i}/${n}`, 8, 24);
+}
+
+function draw(idx) {
+  const ox = Math.floor((canvas.width  - w) / 2);
+  const oy = Math.floor((canvas.height - h) / 2);
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(bitmaps[idx], ox, oy);
+  shown = idx; window.nsp.index = idx; window.nsp.drawn++;
+}
+
+let lastDraw = null, index = 0;
+function loop(now) {
+  if (lastDraw === null) lastDraw = now;
+  if (now - lastDraw >= period - 0.5) {
+    lastDraw = now; index = (index + 1) % n; draw(index);
+  }
+  requestAnimationFrame(loop);
+}
+
+function start() {
+  if (hold !== null) { draw(((hold % n) + n) % n); return; }
+  draw(0); requestAnimationFrame(loop);
+}
+
+function loadNext(i) {
+  if (i >= n) { start(); return; }
+  drawLoading(i);
+  const img = new Image();
+  img.onload = () => {
+    createImageBitmap(img, {colorSpaceConversion: 'none', premultiplyAlpha: 'none'}).then(bm => {
+      bitmaps[i] = bm; loaded++; loadNext(i + 1);
+    });
+  };
+  img.onerror = () => {
+    failed = true;
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#f00'; ctx.font = '20px monospace';
+    ctx.fillText(`FAILED frame ${i}`, 8, 40);
+  };
+  img.src = base + `frame_${String(i).padStart(4,'0')}.png`;
+  imgs[i] = img;
+}
+
+loadNext(0);
+</script></body></html>
