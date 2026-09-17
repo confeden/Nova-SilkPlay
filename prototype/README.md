@@ -222,6 +222,13 @@ check.
   pixel to pixel. Measured against that version: spurious edges on real 1440p
   footage -67..-73 %, analytic scenes +1.05 / +4.08 / +3.36 dB (A1 / A3 / A4).
 
+  **Scene cuts** (P23): once per pair the GPU compares tone histograms of the two
+  frames and how much of the picture the field still cannot explain. A hard cut
+  holds the frame before it until the next one is due — the cut stays a cut
+  instead of a mosaic of both shots — and a pair that is merely unexplainable
+  (something sweeping in from off-frame) is cross-faded. No readback: the
+  decision is a 1x1 texture the warp samples. `NSP_CUT_STATS=1` logs it per pair.
+
   `--warp-lab N [--warp-lab-p F]` and `--field-lab N [--field-lab-p F]` run the
   variants P21 compared (the pre-P21 warp is `--warp-lab 99 --no-field-cohere`);
   `harness/warp_lab.py` scores them on real footage.
