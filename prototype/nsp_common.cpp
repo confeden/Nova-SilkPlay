@@ -69,6 +69,12 @@ BOOL CALLBACK EnumProc(HWND hwnd, LPARAM lp) {
     auto* ctx = reinterpret_cast<EnumCtx*>(lp);
     if (!IsWindowVisible(hwnd)) return TRUE;
     if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+    // Never this process's own windows: none of them is a capture target, and asking a window
+    // that another of our threads owns for its title SENDS it a message — the Settings window
+    // would make the engine thread wait on the tray's UI thread (I15).
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId()) return TRUE;
 
     wchar_t title[512] = {};
     if (GetWindowTextW(hwnd, title, ARRAYSIZE(title)) == 0) return TRUE;

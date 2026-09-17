@@ -1,0 +1,37 @@
+// silkplay.rc — icons, version information and the manifest of silkplay.exe.
+#include <windows.h>
+
+#include "nsp_resource.h"
+#include "nsp_version.h"
+
+IDI_SILK     ICON "res\\silk.ico"
+IDI_SILK_OFF ICON "res\\silk_off.ico"
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "silkplay.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION NSP_VERSION_MAJOR, NSP_VERSION_MINOR, NSP_VERSION_PATCH, NSP_VERSION_BUILD
+ PRODUCTVERSION NSP_VERSION_MAJOR, NSP_VERSION_MINOR, NSP_VERSION_PATCH, NSP_VERSION_BUILD
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS VS_FF_PRERELEASE
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "ProductName", "Nova SilkPlay"
+            VALUE "FileDescription", "Nova SilkPlay"
+            VALUE "ProductVersion", NSP_VERSION_TEXT
+            VALUE "FileVersion", NSP_VERSION_TEXT
+            VALUE "InternalName", "silkplay"
+            VALUE "OriginalFilename", "silkplay.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

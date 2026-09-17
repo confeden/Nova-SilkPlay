@@ -176,7 +176,75 @@ Global hotkeys while it runs:
 | `Ctrl+Alt+X` | quit (**X**, not Q) |
 
 A hotkey another program already owns fails to register; that is logged at
-startup and nothing else breaks.
+startup and nothing else breaks. Ctrl+C or closing the console window quits the
+same clean way (the tray icon goes with it instead of lingering until hovered).
+
+## Tray and Settings
+
+The version is `0.9.0-dev` — a development build of the first beta, 0.9 (D30) —
+shown by `--help`, in Settings with the commit it was built from (`+` = uncommitted
+changes), and in the file's version resource.
+
+The tray icon is a **pink silk ribbon**, grey while frame generation is off
+(`res/silk.ico`, `res/silk_off.ico`, rendered from a model by `res/make_icons.py`,
+each size separately so the 16-24 px tray sizes stay legible). **Left click opens
+Settings**; right click opens the menu: Settings…, Frame generation (`Ctrl+Alt+Q`),
+Cycle render mode (debug), Quit. The hover text says what the engine is doing:
+waiting for fullscreen video in Chrome, `24 → 165 fps in Chrome`, paused because a
+window covers the video, no video playing, or off.
+
+Settings apply the moment they change and are saved to
+`%LOCALAPPDATA%\Nova SilkPlay\settings.json`:
+
+| Setting | Effect |
+|---|---|
+| Browsers → Google Chrome | the one browser of the first beta (D30). Off: nothing is captured, and an attached Chrome is let go at once |
+| Players → PotPlayer | listed and disabled: the player path comes after the beta |
+| General → Frame rate counter | the readout below; `--no-badge` overrides it |
+| General → Language | Same as Windows / English / Русский — the tray menu, its hover text and the window; logs stay English |
+
+A `--target-*` flag overrides the browser choice (developer runs), `--settings-file`
+points at another file, `--ui-monitor N` opens Settings on monitor N (1 = primary)
+instead of under the pointer, and `--ui-lang en|ru` sets this run's language.
+**`--default-settings`** ignores the file for the run (built-in defaults, nothing read
+or saved): every measurement script that starts the engine passes it
+(`tools/yt-check`, `tools/ls-compare/record_arms.py` and the live tests here), so the
+owner's choices — Chrome off, no counter — can never change what they measure.
+
+A settings file that exists but **cannot be read** (a hand edit that broke the JSON,
+a file held by a scanner beyond one retry) is not treated as a first run: the user
+made choices this run cannot see, so it **fails closed** — nothing is captured until
+a browser is chosen in Settings, and the hover text says the settings could not be
+read — and the file is moved aside to `settings.json.unreadable` so the next save
+cannot overwrite it (if even that move fails, nothing is saved for the run). A save
+that meets a short lock on the file retries for ~200 ms before it gives up and logs.
+
+Closing the program from outside — `WM_CLOSE` on its tray window, as `taskkill`
+without `/F` sends — quits it cleanly, the same as the menu's Quit.
+
+**Why a thread of its own.** `TrackPopupMenu` and dragging a window both run modal
+loops inside the call that dispatches the message. On the engine's thread either one
+stopped the loop, and the overlay kept its last frame over a video that plays on —
+a frozen picture for as long as the menu was open, and the menu is small enough to
+count as a widget, so nothing paused generation for it. The tray, its menu and the
+Settings window now run on a UI thread and talk to the engine through a
+mutex-guarded mailbox (`nsp_tray.h`); the engine only reads a command queue and a
+copy of the settings between ticks. The tray's window is a hidden top-level one, not
+message-only: a message-only window never received `TaskbarCreated`, so the old icon
+did not come back after an Explorer restart.
+
+Checks:
+
+```cmd
+tests\build_settings_test.cmd && tests\settings_test.exe   rem load/save, 13 checks
+python tray_live_test.py                                  rem the running exe via window messages, 40 checks
+silkplay.exe --ui-snapshot settings.png --ui-lang ru      rem draws Settings on monitor 2, no focus taken
+```
+
+`tray_live_test.py` never attaches to a browser (a `--target-exe` that matches
+nothing, or Chrome unselected), so it is safe to run while a video plays. Run it only
+after a build that succeeded: chained after a failed `build.cmd` it tests the previous
+`silkplay.exe`, whose behaviour the checks may assume is gone.
 
 ## The frame-rate readout
 
@@ -189,8 +257,9 @@ numbers carry hysteresis so they do not flicker between two neighbours. Glyphs a
 pass system as everything else (the string and a 0-9 and `/` font table packed into
 the constant buffer), so it needs no font, no Direct2D and no texture.
 
-`--no-badge` turns it off, which is required for a bit-exact passthrough alignment
-check.
+The Settings window's *Frame rate counter* switch turns it on and off while the
+engine runs. `--no-badge` turns it off for the run whatever the settings say, which
+is required for a bit-exact passthrough alignment check.
 
 ## The three modes
 
@@ -363,6 +432,14 @@ sources, not an average of them.
 | `nsp_overlay.*` | the D3D11 device, the overlay HWND, DComp, the composition swapchain |
 | `nsp_capture.*` | WGC → a five-slot GPU ring of video-rect crops (older, previous, reference, newest, pending), and the test that tells a video frame from a UI-only recomposition |
 | `nsp_winwatch.*` | WinEvent hooks that re-run the occlusion test the moment windows change |
+| `nsp_tray.*` | the UI thread: the tray icon, its menu, and the mailbox between it and the engine |
+| `nsp_settings_window.*` | the Settings window (cards, owner-drawn switches, DPI changes, keyboard) |
+| `nsp_settings.*` | `settings.json`: load with per-value fallback, save by write-then-rename |
+| `nsp_ui_text.*` | every string a user reads, in English and Russian |
+| `nsp_version.h`, `nsp_resource.h`, `silkplay.rc`, `silkplay.manifest` | the version, the icons, Common Controls 6 |
+| `res/make_icons.py` | renders the silk ribbon icons (`python make_icons.py`; also writes `icon_preview.png`) |
+| `tests/settings_test.cpp` | load/save behaviour in a temp directory, locked and broken files included (`tests\build_settings_test.cmd`, 13 checks) |
+| `tray_live_test.py` | the tray, Settings and the engine's reaction, live, through window messages: menu and Settings, Ctrl+Break, a broken settings file, `WM_CLOSE` from outside (40 checks) |
 | `nsp_synth.*` | the luma pyramid, the block matcher, the three motion fields (and the held copy of the previous pair's), the warp, the cross-fade and the frame-rate readout |
 | `nsp_ofa.*` | NVOFA through its D3D11 entry point: our device, our textures, both directions in one execute |
 | `nsp_offline.*` | `--offline`: the same `Synth` over frames from disk, with the G0/G1 gates |

@@ -307,7 +307,7 @@ def run_clip(name, url, start, a, primary):
         log(f"{name} off: {json.dumps(out['off']['rvfc'])} | {json.dumps(out['off']['dda'])}")
 
         elog = open(os.path.join(a.out, f"{name}_engine.log"), "w", encoding="utf-8")
-        engine = subprocess.Popen([ENGINE], cwd=os.path.dirname(ENGINE), stdout=elog,
+        engine = subprocess.Popen([ENGINE, "--default-settings"], cwd=os.path.dirname(ENGINE), stdout=elog,
                                   stderr=subprocess.STDOUT)
         shown = wait_for(lambda: "SHOWN" in open(os.path.join(a.out, f"{name}_engine.log"),
                                                  encoding="utf-8", errors="replace").read(), 30, 0.5)

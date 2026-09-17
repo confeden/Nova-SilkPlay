@@ -92,7 +92,7 @@ def main():
                 g.record(rect, w, h, args.seconds, prefix)
             elif arm == "ours":
                 log = open(prefix + "_engine.log", "w", encoding="utf-8")
-                proc = subprocess.Popen([ENGINE, "--no-badge", "--stats-every", "2"], stdout=log,
+                proc = subprocess.Popen([ENGINE, "--default-settings", "--no-badge", "--stats-every", "2"], stdout=log,
                                         stderr=subprocess.STDOUT, cwd=os.path.dirname(ENGINE))
                 deadline = time.time() + 20
                 while time.time() < deadline:

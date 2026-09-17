@@ -18,18 +18,25 @@
 #include "nsp_capture.h"
 #include "nsp_common.h"
 #include "nsp_dump.h"
+#include "nsp_image.h"
 #include "nsp_offline.h"
 #include "nsp_overlay.h"
+#include "nsp_settings.h"
+#include "nsp_settings_window.h"
 #include "nsp_tray.h"
 #include "nsp_synth.h"
+#include "nsp_ui_text.h"
+#include "nsp_version.h"
 #include "nsp_winwatch.h"
 
 #include <dwmapi.h>
+#include <shellapi.h>  // CommandLineToArgvW
 
 #include <objbase.h>
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -70,6 +77,9 @@ struct AppOptions {
     std::wstring targetTitle;
     std::wstring targetExe = L"chrome.exe";
     DWORD targetPid = 0;
+    // Any --target-* flag is a developer override: while one is given, the Settings window's
+    // choice of browser does not decide what is captured.
+    bool targetFromCli = false;
 
     bool haveRect = false;
     RECT rectClient{};  // video rect relative to the target's CLIENT origin
@@ -99,6 +109,7 @@ struct AppOptions {
     bool   listWindows = false;
     bool   listDisplays = false;
     bool   badge = true;         // the "24/165" readout in the top-right corner of the video
+    bool   badgeFromCli = false; // --no-badge given: the Settings counter switch does not override it
     int    cellPx = 8;           // motion field cell, full-res pixels
     // MEASURED default. On the first real corpus — Meridian 59.94p decimated to
     // stride 2, 49 triples, each middle frame withheld as ground truth — NVOFA
@@ -134,6 +145,13 @@ struct AppOptions {
     bool   ofaSeedHints = false;    // --ofa-seed-hints: real seeds in NVOFA's hint buffer (G54)
     float  fieldLabParam = 0.02f; // --field-lab-p F
 
+    // Tray and Settings (P7).
+    std::string settingsFile;  // --settings-file: instead of %LOCALAPPDATA%\Nova SilkPlay\settings.json
+    bool defaultSettings = false;  // --default-settings: built-in defaults, no file read or written
+    int  uiMonitor = 0;        // --ui-monitor N: where Settings opens; 0 = under the pointer, 1 = primary
+    std::string uiSnapshot;    // --ui-snapshot FILE.png: draw the Settings window to a file and exit
+    int  uiLang = -1;          // --ui-lang en|ru: this run's interface language, not saved
+
     // Development aid: after `dumpAfterSec` of steady playback, write the two
     // source frames and the synthesized in-between frame, then exit.
     std::string dumpPrefix;
@@ -142,7 +160,7 @@ struct AppOptions {
 
 void PrintUsage() {
     printf(
-        "Nova SilkPlay prototype — frame generation over a browser window.\n"
+        "Nova SilkPlay " NSP_VERSION_TEXT " — frame generation over a browser window.\n"
         "\n"
         "  --list-windows           dump candidate windows and exit\n"
         "  --target-class STR       window class (default Chrome_WidgetWin_1)\n"
@@ -181,10 +199,22 @@ void PrintUsage() {
         "  --warp-lab N             warp laboratory: branch maps / ablations (P21)\n"
         "  --field-lab N            per-pair field coherence lab (P21)\n"
         "  --no-field-cohere        turn off the per-pair field coherence pass (P21)\n"
+        "  --settings-file PATH     settings JSON (default %%LOCALAPPDATA%%\\Nova SilkPlay\\\n"
+        "                           settings.json); the Settings window saves here\n"
+        "  --default-settings       built-in settings for this run: settings.json is neither\n"
+        "                           read nor written (measurement tools pass this, so the\n"
+        "                           owner's choices never change what they measure)\n"
+        "  --ui-monitor N           open Settings on monitor N (1 = primary, 2 = the next);\n"
+        "                           default: the monitor under the pointer\n"
+        "  --ui-lang en|ru          interface language for this run, not saved\n"
+        "  --ui-snapshot FILE.png   draw the Settings window (default on monitor 2, without\n"
+        "                           taking the focus) to FILE.png and exit\n"
         "  --stats-every F          stats line interval in seconds (default 3)\n"
         "  --dump PREFIX            write PREFIX_a/_b/_mc/_blend .ppm after a few\n"
         "                           seconds of playback, then exit (dev aid)\n"
         "  --dump-after F           when to dump, in seconds (default 4)\n"
+        "\n"
+        "Tray icon: left click opens Settings, right click the menu.\n"
         "\n"
         "Hotkeys (global): Ctrl+Alt+Q or Ctrl+Alt+O  frame generation ON/OFF\n"
         "                  Ctrl+Alt+M                cycle mc -> blend -> passthrough\n"
@@ -227,13 +257,17 @@ bool ParseArgs(int argc, char** argv, AppOptions* opt) {
             opt->listWindows = true;
         } else if (a == "--target-class" && next(&v)) {
             opt->targetClass = Widen(v);
+            opt->targetFromCli = true;
         } else if (a == "--target-exe" && next(&v)) {
             opt->targetExe = Widen(v);
+            opt->targetFromCli = true;
         } else if (a == "--target-title" && next(&v)) {
             opt->targetTitle = Widen(v);
+            opt->targetFromCli = true;
         } else if (a == "--target-pid" && next(&v)) {
             opt->targetPid = static_cast<DWORD>(strtoul(v, nullptr, 10));
             opt->targetExe.clear();  // an explicit pid is the whole answer
+            opt->targetFromCli = true;
         } else if (a == "--rect" && next(&v)) {
             if (!ParseRect(v, &opt->rectClient)) {
                 LogErr("bad --rect '%s'", v);
@@ -330,6 +364,24 @@ bool ParseArgs(int argc, char** argv, AppOptions* opt) {
             opt->cellPx = atoi(v);
         } else if (a == "--no-badge") {
             opt->badge = false;
+            opt->badgeFromCli = true;
+        } else if (a == "--settings-file" && next(&v)) {
+            opt->settingsFile = v;
+        } else if (a == "--default-settings") {
+            opt->defaultSettings = true;
+        } else if (a == "--ui-monitor" && next(&v)) {
+            opt->uiMonitor = atoi(v);
+        } else if (a == "--ui-snapshot" && next(&v)) {
+            opt->uiSnapshot = v;
+        } else if (a == "--ui-lang" && next(&v)) {
+            if (strcmp(v, "en") == 0) {
+                opt->uiLang = static_cast<int>(UiLanguage::kEnglish);
+            } else if (strcmp(v, "ru") == 0) {
+                opt->uiLang = static_cast<int>(UiLanguage::kRussian);
+            } else {
+                LogErr("bad --ui-lang '%s' (en|ru)", v);
+                return false;
+            }
         } else if (a == "--offline" && next(&v)) {
             opt->offlineDir = v;
         } else if (a == "--offline-out" && next(&v)) {
@@ -762,11 +814,34 @@ void UninstallHotkeys() {
     for (int id = kHkToggle; id <= kHkQuit; ++id) UnregisterHotKey(nullptr, id);
 }
 
+// ------------------------------------------------------------------ console
+
+// Ctrl+C, Ctrl+Break and closing the console window all mean "quit". Without a handler the
+// process is killed where it stands: the overlay and capture are not released cleanly and the
+// tray icon stays behind as a dead entry until the pointer passes over it.
+std::atomic<bool> g_consoleQuit{false};
+HANDLE g_runDone = nullptr;  // set once the main loop has cleaned up
+
+BOOL WINAPI OnConsoleCtrl(DWORD type) {
+    g_consoleQuit.store(true);
+    if (type == CTRL_CLOSE_EVENT && g_runDone) {
+        // Windows ends the process as soon as this returns: hold it until the loop is done. The
+        // loop notices within one iteration (at most ~100 ms of compositor-clock wait).
+        WaitForSingleObject(g_runDone, 4000);
+    }
+    return TRUE;
+}
+
 // ---------------------------------------------------------------------- app
 
 class App {
 public:
-    explicit App(const AppOptions& opt) : opt_(opt) {}
+    App(const AppOptions& opt, const Settings& settings, const std::wstring& settingsPath,
+        bool settingsUnreadable)
+        : opt_(opt), settings_(settings), settingsPath_(settingsPath),
+          settingsUnreadable_(settingsUnreadable) {
+        if (!opt_.badgeFromCli) opt_.badge = settings_.showFpsCounter;
+    }
 
     int Run();
 
@@ -781,8 +856,15 @@ private:
     bool DoDump();
     // "<source fps>/<output fps>" for the readout.
     std::string FpsText() const;
+    // A change made in the Settings window, applied between ticks.
+    void ApplySettings(const Settings& s);
+    // The tray icon's hover text: what the engine is doing right now, in the user's language.
+    std::wstring TrayStatus() const;
 
     AppOptions opt_;
+    Settings settings_;
+    std::wstring settingsPath_;       // empty: changes apply to this run only
+    bool settingsUnreadable_ = false; // the file existed but could not be read: nothing is captured
     TargetWindow target_{};
     RECT videoClient_{};  // video rect relative to the client origin (source of truth)
 
@@ -857,6 +939,13 @@ bool App::ResolveTarget() {
     // fullscreen video is the normal state now, and a line a second would bury
     // everything else in the log.
     const bool verbose = reengageFails_ == 0 || ((reengageFails_ + 1) % 30) == 0;
+    // Settings decide the target unless a --target-* flag does. Google Chrome is the one browser
+    // the beta captures (D30); its window class is shared by every Chromium and Electron program,
+    // so the process image is what actually selects it.
+    if (!opt_.targetFromCli && !settings_.captureChrome) {
+        if (verbose) Log("no browser is selected in Settings - nothing to capture");
+        return false;
+    }
     if (!FindTarget(opt_.targetClass, opt_.targetTitle, opt_.targetPid, &t, opt_.targetExe,
                     NeedFullscreen(), verbose)) {
         if (!verbose) return false;
@@ -1314,6 +1403,59 @@ std::string App::FpsText() const {
     return std::to_string(shownSrcFps_) + "/" + std::to_string(shownOutFps_);
 }
 
+void App::ApplySettings(const Settings& s) {
+    const Settings old = settings_;
+    settings_ = s;
+    settingsUnreadable_ = false;  // whatever the file said, the user has chosen now
+    if (old.captureChrome != s.captureChrome)
+        Log("settings: Google Chrome %s%s", s.captureChrome ? "selected" : "not selected",
+            opt_.targetFromCli ? " (no effect: a --target-* flag decides the target)" : "");
+    if (old.showFpsCounter != s.showFpsCounter) {
+        if (!opt_.badgeFromCli) opt_.badge = s.showFpsCounter;
+        Log("settings: frame rate counter %s%s", s.showFpsCounter ? "on" : "off",
+            opt_.badgeFromCli ? " (no effect: --no-badge)" : "");
+    }
+    if (old.language != s.language)
+        Log("settings: language %s", s.language == UiLanguage::kRussian   ? "ru"
+                                     : s.language == UiLanguage::kEnglish ? "en"
+                                                                          : "auto");
+    // A browser that is no longer selected is let go at once, not at the next re-engage.
+    if (engaged_ && !opt_.targetFromCli && !settings_.captureChrome) {
+        Log("the captured browser is no longer selected - disengaging");
+        Disengage();
+    }
+    lastTrayStatus_ = 0;
+}
+
+std::wstring App::TrayStatus() const {
+    std::wstring app = L"Chrome";
+    if (engaged_ && !target_.exe.empty() && _wcsicmp(target_.exe.c_str(), L"chrome.exe") != 0) {
+        app = target_.exe;
+    } else if (!engaged_ && opt_.targetFromCli && !opt_.targetExe.empty() &&
+               _wcsicmp(opt_.targetExe.c_str(), L"chrome.exe") != 0) {
+        app = opt_.targetExe;
+    }
+    // Truncated, never checked: a process image name can be MAX_PATH long, and swprintf_s ends
+    // the process on overflow. The shell cuts the tooltip at 127 characters anyway.
+    wchar_t text[128];
+    if (!wantShown_) {
+        _snwprintf_s(text, _TRUNCATE, L"%ls", Tr(Txt::kStatusOff));
+    } else if (!opt_.targetFromCli && settingsUnreadable_) {
+        _snwprintf_s(text, _TRUNCATE, L"%ls", Tr(Txt::kStatusSettingsUnreadable));
+    } else if (!opt_.targetFromCli && !settings_.captureChrome) {
+        _snwprintf_s(text, _TRUNCATE, L"%ls", Tr(Txt::kStatusNothingSelected));
+    } else if (!engaged_) {
+        _snwprintf_s(text, _TRUNCATE, Tr(Txt::kStatusWaiting), app.c_str());
+    } else if (obscured_) {
+        _snwprintf_s(text, _TRUNCATE, L"%ls", Tr(Txt::kStatusCovered));
+    } else if (!overlay_ || !overlay_->IsShown()) {
+        _snwprintf_s(text, _TRUNCATE, Tr(Txt::kStatusNoVideo), app.c_str());
+    } else {
+        _snwprintf_s(text, _TRUNCATE, Tr(Txt::kStatusGenerating), shownSrcFps_, shownOutFps_, app.c_str());
+    }
+    return std::wstring(L"Nova SilkPlay \u2014 ") + text;
+}
+
 // Writes the two source frames and what the synthesizer puts between them, so
 // the result can be judged off-screen: at t=0.5 a moving edge must be ONE edge
 // at the midpoint (motion compensation worked), not two faint ones (a
@@ -1481,8 +1623,12 @@ int App::Run() {
                "found by the 10 Hz poll only");
     {
         std::string trayErr;
-        if (!tray_.Create(L"Nova SilkPlay - starting", &trayErr))
+        if (!tray_.Create(settings_, settingsPath_, opt_.uiMonitor, &trayErr))
             LogErr("%s - continuing without a tray icon", trayErr.c_str());
+        tray_.SetStatus(TrayStatus());
+        Log("settings: %s - Google Chrome %s, frame rate counter %s",
+            settingsPath_.empty() ? "(not saved this run)" : Narrow(settingsPath_).c_str(),
+            settings_.captureChrome ? "on" : "off", opt_.badge ? "on" : "off");
     }
     // A failed FIRST engage is not fatal any more. The loop below already
     // retries once a second, so starting before Chrome exists — or before any
@@ -1527,7 +1673,11 @@ int App::Run() {
                 wantShown_ = !wantShown_;
                 if (!wantShown_ && overlay_) overlay_->Hide();
                 tray_.SetEngineOn(wantShown_);
+                lastTrayStatus_ = 0;
                 Log("frame generation %s (tray)", wantShown_ ? "ON" : "OFF");
+                break;
+            case Tray::Command::kSettingsChanged:
+                ApplySettings(tray_.CurrentSettings());
                 break;
             case Tray::Command::kCycleMode:
                 opt_.mode = NextMode(opt_.mode);
@@ -1557,6 +1707,7 @@ int App::Run() {
                         wantShown_ = !wantShown_;
                         if (!wantShown_ && overlay_) overlay_->Hide();
                         tray_.SetEngineOn(wantShown_);
+                        lastTrayStatus_ = 0;
                         Log("frame generation %s (Ctrl+Alt+Q) - the PROGRAM keeps running; "
                             "Ctrl+Alt+X or the tray menu quits",
                             wantShown_ ? "ON" : "OFF");
@@ -1586,6 +1737,10 @@ int App::Run() {
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+        if (!quit_ && g_consoleQuit.load()) {
+            Log("console closed or Ctrl+C - quitting");
+            quit_ = true;
         }
         if (quit_) break;
 
@@ -1783,13 +1938,103 @@ int App::Run() {
         }
 
         LogStats();
+        if (QpcToSec(QpcNow() - lastTrayStatus_) >= 1.0) {
+            lastTrayStatus_ = QpcNow();
+            tray_.SetStatus(TrayStatus());
+        }
     }
 
+    // The tray first: it is what the user sees, and closing the console leaves only a few seconds
+    // (OnConsoleCtrl) — an icon removed last could be killed with the process and linger in the
+    // notification area until the pointer passes over it.
+    tray_.Destroy();
     Disengage();
     watch_.Stop();
     UninstallHotkeys();
-    tray_.Destroy();
     return 0;
+}
+
+// The value after `flag` on the WIDE command line (the last one, as ParseArgs keeps). argv is in
+// the ANSI code page, which cannot hold every path — a Cyrillic folder on an English-language
+// Windows — and the settings path is one this program writes to.
+std::wstring WideArgValue(const wchar_t* flag) {
+    int n = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &n);
+    std::wstring out;
+    if (wargv) {
+        for (int i = 1; i + 1 < n; ++i)
+            if (wcscmp(wargv[i], flag) == 0) out = wargv[i + 1];
+        LocalFree(wargv);
+    }
+    return out;
+}
+
+// --ui-snapshot: opens the Settings window without taking the focus, lets it paint, and writes
+// what DWM shows for it to a PNG. The window gets checked without touching anyone's work:
+// by default it opens on the second monitor.
+int RunUiSnapshot(const AppOptions& opt, const Settings& settings) {
+    const ULONG_PTR gdiplus = StartGdiplus();
+    SettingsWindow window;
+    std::string err;
+    if (!window.Show(settings, nullptr, opt.uiMonitor > 0 ? opt.uiMonitor : 2, false, &err)) {
+        LogErr("--ui-snapshot: %s", err.c_str());
+        StopGdiplus(gdiplus);
+        return 2;
+    }
+    const int64_t until = QpcNow() + QpcPerSecond() / 2;
+    MSG msg;
+    while (QpcNow() < until) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(10);
+    }
+
+    RECT wr{};
+    GetWindowRect(window.Hwnd(), &wr);
+    const int w = RectW(wr), h = RectH(wr);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;  // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    const HDC screen = GetDC(nullptr);
+    const HDC mem = CreateCompatibleDC(screen);
+    const HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    int rc = 0;
+    if (!dib || !bits) {
+        LogErr("--ui-snapshot: CreateDIBSection failed");
+        rc = 2;
+    } else {
+        const HGDIOBJ old = SelectObject(mem, dib);
+        // PW_RENDERFULLCONTENT: the picture DWM composes, title bar included.
+        const bool printed = PrintWindow(window.Hwnd(), mem, PW_RENDERFULLCONTENT) != FALSE;
+        SelectObject(mem, old);
+        if (!printed) {
+            LogErr("--ui-snapshot: PrintWindow failed, GetLastError=%lu", GetLastError());
+            rc = 2;
+        } else {
+            auto* px = static_cast<uint8_t*>(bits);
+            for (int i = 0; i < w * h; ++i) px[i * 4 + 3] = 255;  // GDI leaves alpha undefined
+            if (!SaveImageBgraPng(opt.uiSnapshot, px, static_cast<UINT>(w), static_cast<UINT>(h),
+                                  static_cast<UINT>(w * 4), &err)) {
+                LogErr("--ui-snapshot: %s", err.c_str());
+                rc = 2;
+            } else {
+                Log("--ui-snapshot: %dx%d window written to %s", w, h, opt.uiSnapshot.c_str());
+            }
+        }
+    }
+    if (dib) DeleteObject(dib);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    window.Close();
+    StopGdiplus(gdiplus);
+    return rc;
 }
 
 int RunMain(int argc, char** argv) {
@@ -1878,6 +2123,55 @@ int RunMain(int argc, char** argv) {
         return 0;
     }
 
+    // Settings are read before anything that shows UI.
+    std::wstring settingsPath;
+    if (!opt.defaultSettings)
+        settingsPath = opt.settingsFile.empty() ? SettingsPath() : WideArgValue(L"--settings-file");
+    Settings settings;
+    bool settingsUnreadable = false;
+    if (opt.defaultSettings) {
+        Log("settings: built-in defaults (--default-settings) - nothing is read or saved this run");
+    } else if (settingsPath.empty()) {
+        LogErr("settings: no location for settings.json (LOCALAPPDATA unresolved) - built-in "
+               "defaults, nothing saved this run");
+    } else {
+        std::string err;
+        bool loaded = LoadSettingsFrom(settingsPath, &settings, &err);
+        if (!loaded) {
+            // Once more after a moment: a scanner holding the file briefly is the likely cause.
+            Sleep(250);
+            err.clear();
+            loaded = LoadSettingsFrom(settingsPath, &settings, &err);
+        }
+        if (!loaded) {
+            // Unreadable is not "first run": the user made choices this run cannot see. Fail closed
+            // — capture nothing until a browser is chosen again — and keep what they wrote: the
+            // file is moved aside so the next save cannot overwrite it, and if even that fails,
+            // nothing is saved this run.
+            settingsUnreadable = true;
+            settings = Settings{};
+            settings.captureChrome = false;
+            const std::wstring aside = settingsPath + L".unreadable";
+            if (MoveFileExW(settingsPath.c_str(), aside.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                LogErr("%s - kept as %s; nothing is captured until a browser is chosen in Settings",
+                       err.c_str(), Narrow(aside).c_str());
+            } else {
+                const DWORD e = GetLastError();
+                LogErr("%s - could not move it aside (GetLastError=%lu); nothing is captured and "
+                       "nothing is saved this run",
+                       err.c_str(), e);
+                settingsPath.clear();
+            }
+        }
+    }
+    SetUiLanguage(opt.uiLang >= 0 ? static_cast<UiLanguage>(opt.uiLang) : settings.language);
+
+    if (!opt.uiSnapshot.empty()) {
+        const int rc = RunUiSnapshot(opt, settings);
+        CoUninitialize();
+        return rc;
+    }
+
     if (opt.listWindows) {
         const auto all = EnumerateWindows();
         printf("%-18s %-8s %-24s %-28s %-22s %-6s %s\n", "HWND", "PID", "PROCESS", "CLASS",
@@ -1902,8 +2196,11 @@ int RunMain(int argc, char** argv) {
         return 3;
     }
 
-    App app(opt);
+    g_runDone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    SetConsoleCtrlHandler(&OnConsoleCtrl, TRUE);
+    App app(opt, settings, settingsPath, settingsUnreadable);
     const int rc = app.Run();
+    if (g_runDone) SetEvent(g_runDone);
     if (instance) CloseHandle(instance);
     CoUninitialize();
     return rc;

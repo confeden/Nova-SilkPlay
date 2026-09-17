@@ -251,7 +251,7 @@ def run_arm(arm, a, W, H, X=0, Y=0):
         time.sleep(3.0)  # controls fade after fullscreen
         if arm == "ours":
             elog = open(prefix + "_engine.log", "w", encoding="utf-8")
-            engine = subprocess.Popen([yc.ENGINE] + a.engine_args.split(), cwd=os.path.dirname(yc.ENGINE), stdout=elog,
+            engine = subprocess.Popen([yc.ENGINE, "--default-settings"] + a.engine_args.split(), cwd=os.path.dirname(yc.ENGINE), stdout=elog,
                                       stderr=subprocess.STDOUT)
             res["shown"] = bool(yc.wait_for(lambda: "overlay shown" in open(prefix + "_engine.log", encoding="utf-8",
                                                                              errors="replace").read(), 30, 0.25))

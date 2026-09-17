@@ -30,7 +30,7 @@ if not tgt:
 L, T, R, B = t.client_rect(tgt)
 log_path = os.path.join(HERE, "still_experiment.log")
 logf = open(log_path, "w", encoding="utf-8")
-proc = subprocess.Popen([os.path.join(HERE, "silkplay.exe"), "--target-title", t.TITLE, "--log-dirty",
+proc = subprocess.Popen([os.path.join(HERE, "silkplay.exe"), "--default-settings", "--target-title", t.TITLE, "--log-dirty",
                          "--stats-every", "1", "--allow-windowed"] + sys.argv[1:], stdout=logf, stderr=subprocess.STDOUT)
 saved = wt.POINT()
 u.GetCursorPos(ctypes.byref(saved))

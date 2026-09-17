@@ -83,7 +83,7 @@ def main():
             t.pump(2500)
 
         # Step 3: launch silkplay
-        cmd = [os.path.join(HERE, "silkplay.exe"),
+        cmd = [os.path.join(HERE, "silkplay.exe"), "--default-settings",
                "--target-title", t.TITLE, "--stats-every", "1"]
         proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=HERE)
 

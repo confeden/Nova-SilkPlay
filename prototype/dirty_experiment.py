@@ -17,7 +17,7 @@ L, T, R, B = t.client_rect(tgt)
 cx, cy = (L + R) // 2, (T + B) // 2
 log_path = "dirty_experiment.log"
 logf = open(log_path, "w", encoding="utf-8")
-proc = subprocess.Popen([os.path.join(os.path.dirname(os.path.abspath(__file__)), "silkplay.exe"), "--target-title", t.TITLE, "--log-dirty", "--stats-every", "0.5", "--allow-windowed"] + sys.argv[1:],
+proc = subprocess.Popen([os.path.join(os.path.dirname(os.path.abspath(__file__)), "silkplay.exe"), "--default-settings", "--target-title", t.TITLE, "--log-dirty", "--stats-every", "0.5", "--allow-windowed"] + sys.argv[1:],
                         stdout=logf, stderr=subprocess.STDOUT)
 def text():
     return open(log_path, encoding="utf-8", errors="replace").read()

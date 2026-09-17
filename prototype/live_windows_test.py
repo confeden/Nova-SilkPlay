@@ -221,7 +221,7 @@ def main():
     logf = open(log_path, "w", encoding="utf-8")
     # --allow-windowed: the test page is normally a window; the fullscreen-only
     # rule has its own test (fullscreen_gate_test.py).
-    cmd = [args.exe, "--target-title", TITLE, "--stats-every", "2", "--allow-windowed"] + args.extra.split()
+    cmd = [args.exe, "--default-settings", "--target-title", TITLE, "--stats-every", "2", "--allow-windowed"] + args.extra.split()
     proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=HERE)
 
     def log_text():
