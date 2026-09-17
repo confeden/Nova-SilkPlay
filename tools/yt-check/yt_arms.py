@@ -134,6 +134,45 @@ def find_youtube_window():
     return hits[0] if hits else None
 
 
+def kill_profile_chrome(profile, wait_s=10.0):
+    """Chrome processes started on this profile; Browser.close does not always end them,
+    and a survivor makes the next launch hand off to it and never open a DevTools port."""
+    norm = os.path.normcase(os.path.abspath(profile))
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+          "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }")
+
+    def pids():
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True).stdout
+        found = []
+        for line in out.splitlines():
+            pid, _, cmd = line.partition("|")
+            if norm in os.path.normcase(cmd.replace("/", "\\")):
+                found.append(int(pid))
+        return found
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < wait_s and pids():
+        time.sleep(0.5)
+    left = pids()
+    for pid in left:
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+    return len(left)
+
+
+def screenshot_on_failure(cdp, path):
+    try:
+        import base64
+        tg = cc.list_page_targets(cdp)
+        if not tg:
+            return
+        sid = cc.attach_page(cdp, tg[0]["targetId"])
+        shot = cdp.send("Page.captureScreenshot", {"format": "png"}, session_id=sid)
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(shot["data"]))
+    except Exception:  # noqa: BLE001 - evidence is best effort
+        pass
+
+
 def open_fullscreen(a, W, H, X=0, Y=0):
     stale = os.path.join(a.profile, "DevToolsActivePort")
     if os.path.exists(stale):
@@ -141,14 +180,29 @@ def open_fullscreen(a, W, H, X=0, Y=0):
     extra = ["--mute-audio", "--window-position=120,120", "--window-size=1600,900"]
     if a.proxy:
         extra.append(f"--proxy-server={a.proxy}")
+    kill_profile_chrome(a.profile, wait_s=0.0)
     sess = cc.launch_chrome(f"{a.url}&t={int(a.start)}s", user_data_dir=a.profile, extra_args=extra)
     cdp = cc.CDP(sess.ws_url, timeout=60)
+    try:
+        return _open_fullscreen(a, W, H, X, Y, sess, cdp)
+    except Exception:
+        screenshot_on_failure(cdp, os.path.join(a.out, f"{a.name}_open_failure.png"))
+        try:
+            cdp.send("Browser.close")
+        except Exception:  # noqa: BLE001
+            pass
+        cdp.close()
+        kill_profile_chrome(a.profile)
+        raise
+
+
+def _open_fullscreen(a, W, H, X, Y, sess, cdp):
     tgt = yc.wait_for(lambda: next((t for t in cc.list_page_targets(cdp)
                                     if "youtube.com/watch" in t.get("url", "")), None), 60)
     if not tgt:
         raise RuntimeError("no YouTube page target")
     sid = cc.attach_page(cdp, tgt["targetId"])
-    if not yc.wait_for(lambda: yc.js(cdp, sid, "!!document.querySelector('video') && document.querySelector('video').readyState >= 2"), 90):
+    if not yc.wait_for(lambda: yc.js(cdp, sid, "!!document.querySelector('video') && document.querySelector('video').readyState >= 2"), a.load_timeout):
         raise RuntimeError("video element never became ready")
     yc.pass_ads(cdp, sid, 120)
     if not yc.wait_for(lambda: (lambda st: st["t"] and st["t"] > a.start + 1.0 and st["w"] and not st["paused"])(
@@ -256,7 +310,9 @@ def run_arm(arm, a, W, H, X=0, Y=0):
         except Exception:  # noqa: BLE001
             pass
         cdp.close()
-        time.sleep(2.0)
+        killed = kill_profile_chrome(a.profile)
+        if killed:
+            res["chrome_killed"] = killed
     return res
 
 
@@ -273,6 +329,8 @@ def main():
     ap.add_argument("--proxy")
     ap.add_argument("--quality", default="hd1440")
     ap.add_argument("--monitor", type=int, default=1, help="1 = primary, 2 = the next monitor, ...")
+    ap.add_argument("--load-timeout", type=float, default=240.0,
+                    help="seconds to wait for the video to become playable; the direct route to googlevideo is slow here")
     ap.add_argument("--engine-args", default="", help="extra silkplay.exe arguments for the ours arm, e.g. '--warp-lab 22 --warp-lab-p 0.1'")
     ap.add_argument("--min-width", type=int, default=2560, help="an arm below this videoWidth is invalid")
     ap.add_argument("--profile")
