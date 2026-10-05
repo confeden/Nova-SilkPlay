@@ -1,2 +1,2 @@
-# Nova-SilkPlay
+# Nova SilkPlay
 будет позже
