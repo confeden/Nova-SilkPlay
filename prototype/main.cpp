@@ -1988,7 +1988,7 @@ std::wstring App::TrayStatus() const {
         _snwprintf_s(text, _TRUNCATE, L"%ls", Tr(Txt::kStatusProtected));
     } else if (gamePaused_) {
         // Above the !engaged_ branch on purpose: a gate YIELD disengages us, and
-        // "waiting for fullscreen video" would be a lie while a game is running.
+        // "waiting for a video" would be a lie while a game is running.
         _snwprintf_s(text, _TRUNCATE, Tr(Txt::kStatusGamePaused),
                      gameExe_.empty() ? L"?" : gameExe_.c_str());
     } else if (!engaged_) {
