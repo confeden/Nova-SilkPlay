@@ -248,18 +248,141 @@ after a build that succeeded: chained after a failed `build.cmd` it tests the pr
 
 ## The frame-rate readout
 
-`24/60` — source fps / output fps — in plain white pixel-font text with a thin dark
+`24 → 60` — source fps, then what it becomes — in white text with a thin dark
 outline, fixed 12 px in from the top-right corner of the **video rect**, the way
 Lossless Scaling shows its counter. It never moves and never reacts to the cursor:
 the overlay is `WS_EX_TRANSPARENT` and must never take the pointer (I9, I12). The
-numbers carry hysteresis so they do not flicker between two neighbours. Glyphs are
-2x the 5x7 font (3x at 1400 px of video height and up), drawn by the same shader
-pass system as everything else (the string and a 0-9 and `/` font table packed into
-the constant buffer), so it needs no font, no Direct2D and no texture.
+numbers carry hysteresis so they do not flicker between two neighbours.
+
+It is **real text in a real font**, not drawn glyphs (owner, 2026-09-20): Windows
+rasterises the string once with GDI — Segoe UI Semibold, `ANTIALIASED_QUALITY`,
+never ClearType, whose colour fringes would read as an artefact of ours — into a
+small texture, and the per-tick cost is one scissored quad that reads it back. The
+string changes at most twice a second, so the hot path never touches a font. The
+rasteriser also dilates the coverage by one pixel and stores that as the outline,
+so the shader does one texture read per pixel instead of nine.
+
+The size follows the picture, `videoHeight / 100` clamped to 11..20 px: 11 px on a
+1080p window, 14 px at 1440p, where the old pixel font was 21. Deliberately small —
+the readout is a check, not part of the picture. GDI, not Direct2D + DirectWrite:
+DirectWrite would want a D2D device context on the overlay's own swapchain surface,
+and interleaving D2D with our draws on the same back buffer costs a flush every tick
+and adds a second device to lose.
 
 The Settings window's *Frame rate counter* switch turns it on and off while the
 engine runs. `--no-badge` turns it off for the run whatever the settings say, which
 is required for a bit-exact passthrough alignment check.
+
+## Pausing for a game
+
+Frame generation stops while a game has the GPU (I1, I2, D3) and comes back when it
+lets go. The gate is **two-stage and asymmetric**, because a false stop during
+ordinary browsing is as bad as a missed game.
+
+*Stage 1 names a candidate* from the FOREGROUND window only: a foreign fullscreen
+window on any monitor, the shell reporting exclusive-fullscreen D3D
+(`SHQueryUserNotificationState`), the foreground image listed in the Game Bar's
+`HKCU\System\GameConfigStore\Children`, or the cursor clipped to less than the
+virtual screen. *Stage 2 confirms it* with GPU load attributed only to that
+candidate's process tree, read from the PDH `GPU Engine` counter set, filtered to our
+own adapter's LUID and to the 3D and compute engines, taken as the max over them.
+
+Load is never consulted without a candidate, and the captured browser's whole process
+tree is excluded by construction — which is what makes N14 unrepeatable: our own
+overlay drives Chrome's GPU process and `dwm.exe` hard, and neither can ever be
+counted. Everything fails **open**: a PDH refusal, an instance name that stops
+parsing, a process we may not open — all of them log and leave the verdict clear,
+because stopping a video because our instrument broke is the worse error.
+
+It samples at 5 Hz on a thread of its own (a foreground change nudges it out of band),
+pauses after 2 qualifying samples, resumes after 3 s of continuous all-clear, and
+after 10 s paused it disengages entirely so the game gets the capture session and the
+few hundred megabytes back. `--no-game-gate` turns it off, which is what an A/B
+against another frame generator needs — that program is itself a fullscreen GPU load.
+
+**Checking it without touching the screen.** `silkplay.exe --game-gate-probe 1800`
+opens no window, creates no overlay and captures nothing: it prints a line per verdict
+change and a summary, so it can run for hours beside real work to prove the half that
+matters most — that it never pauses by mistake. The other half needs a game; rather
+than installing one, `tools\fakegame\fakegame.exe --monitor 2 --seconds 20 --load 90`
+puts a borderless fullscreen D3D11 window on the chosen monitor and loads the 3D
+engine to order.
+
+## Shipping shape: windowless, autostart, installer
+
+The binary is linked `/SUBSYSTEM:WINDOWS` and entered through **`WinMain`** — not
+`wWinMain`, whose CRT startup builds only `__wargv` and leaves `__argv` NULL, which
+crashed on the first argument. Autostart therefore never flashes a console.
+
+Output still reaches a developer three ways, and the lab needed no changes: a
+GUI-subsystem process inherits its standard handles, so `silkplay.exe > run.log` and
+every harness that hands `subprocess.Popen` a pipe work exactly as before; `--console`
+(implied by `--help`, `--offline`, `--dump` and every other switch that prints)
+attaches to the parent console or allocates one; and every line is teed to
+`%LOCALAPPDATA%\Nova SilkPlay\logs\`, ten files kept, which is the only channel an
+autostarted instance has and the thing a beta bug report will carry. `lab.cmd` is the
+one case those do not cover — a human at a `cmd` prompt, which does not wait for a
+GUI-subsystem process.
+
+Because there is no console, `GenerateConsoleCtrlEvent` can no longer stop the
+program. It creates a named manual-reset event instead, `Local\NovaSilkPlay.Quit`;
+setting it leaves the loop by the same path as Ctrl+Alt+X. The installer and
+`tools\soak` both use it.
+
+**Autostart** is an `HKCU\...\Run` value and is deliberately **not** in
+`settings.json`: a copy there would be a second source of truth that disagrees the
+moment the user disables the entry in Task Manager or the program is reinstalled
+elsewhere. The Settings switch reads the registry, writes it, and re-reads it — so a
+failed write or an entry disabled in Task Manager snaps the switch back to the truth
+instead of showing what was wished for. The program never creates the value on its
+own; it only repairs one that already exists and names the wrong path.
+
+**The installer** is `installer\silkplay.iss`, built by `installer\build_installer.cmd`
+into `installer\out\`. Per-user (`PrivilegesRequired=lowest`), no elevation, into
+`{localappdata}\Programs\Nova SilkPlay`; it ships the exe and the licence and nothing
+else. A running instance is detected through `AppMutex` and asked to quit through the
+named event rather than killed, so no ghost tray icon is left behind. Uninstall keeps
+`settings.json` unless the user says otherwise. **Signing is off** and stays off until
+the owner confirms this machine is clean: `/DSign=1` is the switch, and
+`build_installer.cmd` does not pass it.
+
+## Protected video is skipped, not decoded
+
+Invariant I7: DRM-protected video is RECOGNISED and skipped. Nothing here captures,
+decodes or works around protection - the signal is a content decryption module
+running in the browser's own process tree, read from process metadata.
+
+`nsp_drm.*` walks the target browser's children on a thread of its own, once a
+second, and reads each one's command line; a child whose `--utility-sub-type` names
+`media.mojom.CdmService` or `media.mojom.MediaFoundationService`, or whose command
+line names `widevinecdm`, means a CDM is running. The engine reads one
+mutex-guarded snapshot and hides the picture unless the verdict is CLEAR.
+
+**It fails CLOSED, the opposite of the game gate.** A child we cannot open, a
+snapshot that fails, a target we do not know: all of them are `kUnknown`, and
+kUnknown blocks. Generating over content somebody encrypted is the failure this
+exists to prevent; refusing to smooth one page is not. The gate decides only
+whether a PICTURE is shown, never whether we may attach - gating the attach would
+deadlock, because the scanner needs a target pid to reach a clear verdict and only
+attaching gives it one.
+
+**Two limits, both deliberate, both to be written into the beta notes.**
+* The signal is the browser, not the tab. **A Netflix tab left open in the
+  background blocks generation on the YouTube tab in front.** Coarse, and the
+  direction I7 asks us to err in.
+* Everything here is `unverified`. The thresholds of the dead-picture half (a video
+  rect that stays black is the hardware-DRM signature) cannot be honest without
+  measuring real protected playback, and there is no subscription on this machine
+  to measure against (owner, 2026-09-20). That half is written but **not called**.
+  `tools/drm-probe/` is the script that would settle it: it needs someone to play
+  thirty seconds of Netflix, Disney+ or Prime.
+
+The baseline half IS measured: with ordinary browsing this machine runs no CDM
+process at all, 0 of 29 Chrome children were unreadable, and a cold full scan cost
+11 ms - so the process scan can be authoritative rather than advisory.
+
+`--no-drm-gate` turns it off, which every measurement run wants: a harness must not
+be silently gated by a browser state it did not ask about.
 
 ## The three modes
 

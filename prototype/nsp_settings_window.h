@@ -7,8 +7,16 @@
 //
 // Changes apply the moment they are made and are reported through the callback; there is no
 // OK / Cancel, the way Windows 11's own Settings behave.
+//
+// ONE ROW IS DIFFERENT. "Start with Windows" is not part of Settings, is never handed to
+// onChange_ and never reaches settings.json: its truth is the HKCU Run value, and a copy in the
+// JSON would be a second source of truth that disagrees the moment the user disables the entry in
+// Task Manager or copies settings.json to another machine. That row reads the registry when the
+// window opens and re-reads it after every write, so a failed write or a Task Manager veto snaps
+// the switch back to reality instead of showing what the user wished for.
 #pragma once
 
+#include "nsp_autostart.h"
 #include "nsp_common.h"
 #include "nsp_settings.h"
 
@@ -33,13 +41,23 @@ public:
     bool Show(const Settings& current, ChangeFn onChange, int monitor, bool activate,
               std::string* err);
     void Close();
+
+    // A DRAG OR AN OPEN DROPDOWN IS A MODAL LOOP OF THIS WINDOW'S OWN, and the
+    // tray's shutdown message is dispatched BY that loop - so destroying the
+    // window there would pull the ground out from under the loop still running
+    // on it (beta audit, 2026-09-20; the popup menu already had this guard).
+    // Returns true if a modal loop was found and asked to end; the caller must
+    // then come back later rather than closing now.
+    bool CancelModal();
     HWND Hwnd() const { return hwnd_; }
 
     // Tab, Space and Esc. Call for every message of the thread that owns the window.
     bool PreTranslate(MSG* msg);
 
 private:
-    enum Row { kChrome = 0, kPotPlayer, kCounter, kLanguage, kRowCount };
+    // The toggles stay contiguous and the combobox stays last, so the WM_COMMAND range test
+    // `id >= kCtlBase + kChrome && id <= kCtlBase + kCounter` keeps covering exactly the switches.
+    enum Row { kChrome = 0, kPotPlayer, kAutostart, kCounter, kLanguage, kRowCount };
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
     LRESULT Handle(UINT msg, WPARAM wp, LPARAM lp);
@@ -66,8 +84,14 @@ private:
     HWND hwnd_ = nullptr;
     HWND toggles_[kRowCount] = {};  // no toggle on the language row
     HWND combo_ = nullptr;
+    // True between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE: the user is dragging or
+    // sizing this window, and DefWindowProc is running its own message loop on it.
+    bool inSizeMove_ = false;
     HWND lastFocus_ = nullptr;
     int pressedRow_ = -1;
+    // The registry, cached so WM_PAINT does not hit it on every repaint. Refreshed when the
+    // window is created and after every write in Flip() - nowhere else.
+    AutostartState autostart_ = AutostartState::kOff;
     Settings s_;
     ChangeFn onChange_;
     UINT dpi_ = 96;

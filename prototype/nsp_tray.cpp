@@ -22,6 +22,15 @@ constexpr UINT WM_NSP_STATE = WM_APP + 12;     // engine -> UI: status or on/off
 constexpr UINT WM_NSP_SHUTDOWN = WM_APP + 13;  // engine -> UI: remove everything and exit
 constexpr UINT kIconId = 1;
 constexpr UINT_PTR kTimerAddIcon = 1;
+// Shutdown arrived while a modal loop of ours was running: come back on a timer
+// rather than reposting at once. A repost is dispatched by that same loop within
+// microseconds, so a count-based limit was spent before the loop could possibly
+// end (review, 2026-09-20). One tick per frame for at most two seconds gives the
+// loop real time to unwind, and the deadline is what stops us waiting for ever
+// on a user who walked away mid-drag.
+constexpr UINT_PTR kTimerShutdown = 2;
+constexpr UINT kShutdownRetryMs = 16;
+constexpr double kShutdownRetrySec = 2.0;
 constexpr int kAddIconTries = 30;  // every 2 s: a minute for a busy or restarting Explorer
 
 constexpr UINT kCmdSettings = 100;
@@ -65,7 +74,7 @@ struct Tray::Impl {
     bool shownOn = true;
     bool menuOpen = false;
     bool shuttingDown = false;
-    int shutdownRetries = 0;
+    int64_t shutdownSince = 0;  // QPC of the first shutdown attempt that found a modal loop
     int addTries = 0;
     SettingsWindow window;
 
@@ -80,7 +89,20 @@ struct Tray::Impl {
     void Push(Command c);
     void OnSettingsChanged(const Settings& s);
     NOTIFYICONDATAW BaseNid() const;
+    // A balloon from our own icon. Used only for something the user DID and that
+    // did not take effect - never for progress, never unprompted.
+    void Notify(const wchar_t* title, const wchar_t* body);
 };
+
+void Tray::Impl::Notify(const wchar_t* title, const wchar_t* body) {
+    if (!hwnd || !iconAdded) return;
+    NOTIFYICONDATAW nid = BaseNid();
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_WARNING | NIIF_RESPECT_QUIET_TIME;
+    wcsncpy_s(nid.szInfoTitle, title, _TRUNCATE);
+    wcsncpy_s(nid.szInfo, body, _TRUNCATE);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
 
 NOTIFYICONDATAW Tray::Impl::BaseNid() const {
     NOTIFYICONDATAW nid = {};
@@ -182,8 +204,13 @@ void Tray::Impl::OnSettingsChanged(const Settings& s) {
         return;
     }
     std::string err;
-    if (!SaveSettingsTo(settingsPath, s, &err))
+    if (!SaveSettingsTo(settingsPath, s, &err)) {
+        // A switch that flips on screen and is gone after a restart is a bug the
+        // user has no way to notice. The log line is for us; the balloon is for
+        // them (beta audit, 2026-09-20).
         LogErr("%s - the change applies to this run only", err.c_str());
+        Notify(Tr(Txt::kSaveFailedTitle), Tr(Txt::kSaveFailedBody));
+    }
 }
 
 void Tray::Impl::OpenSettings() {
@@ -273,6 +300,10 @@ LRESULT CALLBACK Tray::Impl::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 
         case WM_TIMER:
             if (wp == kTimerAddIcon && !d->iconAdded) d->AddIcon();
+            if (wp == kTimerShutdown) {
+                KillTimer(hwnd, kTimerShutdown);
+                PostMessageW(hwnd, WM_NSP_SHUTDOWN, 0, 0);
+            }
             return 0;
 
         // This window is a real top-level one now (see nsp_tray.h), so anything that closes the
@@ -292,13 +323,30 @@ LRESULT CALLBACK Tray::Impl::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         case WM_NSP_SHUTDOWN:
             // Arriving from inside the menu's modal loop: end the menu first and come back, so
             // the window is not destroyed under TrackPopupMenuEx.
-            if (d->menuOpen && d->shutdownRetries++ < 50) {
-                EndMenu();
-                PostMessageW(hwnd, WM_NSP_SHUTDOWN, 0, 0);
-                return 0;
+            // The Settings window's own loops count too: a title-bar drag and an
+            // open combobox dropdown each run a message loop that would dispatch
+            // THIS message, and destroying the window from inside one pulls the
+            // ground out from under it (beta audit, 2026-09-20).
+            {
+                if (d->shutdownSince == 0) d->shutdownSince = QpcNow();
+                bool modal = false;
+                if (d->menuOpen) {
+                    EndMenu();
+                    modal = true;
+                }
+                if (d->window.CancelModal()) modal = true;
+                if (modal && QpcToSec(QpcNow() - d->shutdownSince) < kShutdownRetrySec) {
+                    SetTimer(hwnd, kTimerShutdown, kShutdownRetryMs, nullptr);
+                    return 0;
+                }
+                if (modal)
+                    LogErr("tray: a modal loop is still running %.1f s after quit was asked for - "
+                           "closing anyway",
+                           QpcToSec(QpcNow() - d->shutdownSince));
             }
             d->shuttingDown = true;
             KillTimer(hwnd, kTimerAddIcon);
+            KillTimer(hwnd, kTimerShutdown);
             d->window.Close();
             d->RemoveIcon();
             DestroyWindow(hwnd);

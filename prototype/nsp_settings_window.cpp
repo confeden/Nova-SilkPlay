@@ -41,14 +41,16 @@ constexpr DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDR
 constexpr DWORD kExStyle = WS_EX_CONTROLPARENT;
 
 // Layout in device-independent pixels (96 DPI). Header, then the three sections: Browsers
-// (Chrome), Players (PotPlayer), General (counter, language), then the hotkey footer.
+// (Chrome), Players (PotPlayer), General (start with Windows, counter, language), then the
+// hotkey footer. General grew one 64 px card, so everything below it moved down by 68 and the
+// client is 68 taller; the 20 px gap above the footer and the 24 px bottom margin are unchanged.
 constexpr int kClientW = 520;
-constexpr int kClientH = 546;
+constexpr int kClientH = 614;
 constexpr int kMargin = 24;
 constexpr int kCardH = 64;
-constexpr int kCardTop[] = {122, 228, 334, 402};  // indexed by Row
+constexpr int kCardTop[] = {122, 228, 334, 402, 470};  // indexed by Row
 constexpr int kSectionTop[] = {96, 202, 308};
-constexpr int kFooterTop = 486;
+constexpr int kFooterTop = 554;
 
 // Windows 11 light Settings colours, with the ribbon's pink as the accent. The pink is darker
 // than the icon's so the white knob of a switched-on toggle keeps its contrast.
@@ -216,6 +218,23 @@ bool SettingsWindow::Show(const Settings& current, ChangeFn onChange, int monito
     return true;
 }
 
+bool SettingsWindow::CancelModal() {
+    if (!hwnd_ || !IsWindow(hwnd_)) return false;
+    bool modal = false;
+    // An open combobox dropdown runs its own loop; closing it ends that loop.
+    if (combo_ && IsWindow(combo_) && SendMessageW(combo_, CB_GETDROPPEDSTATE, 0, 0)) {
+        SendMessageW(combo_, CB_SHOWDROPDOWN, FALSE, 0);
+        modal = true;
+    }
+    // A title-bar drag or a sizing loop: WM_CANCELMODE is the documented way to
+    // end one from outside, and it also releases any mouse capture.
+    if (GetCapture() != nullptr || inSizeMove_) {
+        SendMessageW(hwnd_, WM_CANCELMODE, 0, 0);
+        modal = true;
+    }
+    return modal;
+}
+
 void SettingsWindow::Close() {
     if (hwnd_) DestroyWindow(hwnd_);
 }
@@ -330,6 +349,14 @@ LRESULT SettingsWindow::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
 
+        case WM_ENTERSIZEMOVE:
+            inSizeMove_ = true;
+            return DefWindowProcW(hwnd_, msg, wp, lp);
+
+        case WM_EXITSIZEMOVE:
+            inSizeMove_ = false;
+            return DefWindowProcW(hwnd_, msg, wp, lp);
+
         case WM_CLOSE:
             DestroyWindow(hwnd_);
             return 0;
@@ -355,8 +382,13 @@ bool SettingsWindow::OnCreate() {
     COLORREF caption = kBg;
     DwmSetWindowAttribute(hwnd_, DWMWA_CAPTION_COLOR, &caption, sizeof(caption));
 
+    // The registry is the autostart row's only source of truth, so read it before the first
+    // paint: the window must open showing what is actually registered, not a remembered value.
+    autostart_ = AutostartQuery();
+
     const HINSTANCE inst = GetModuleHandleW(nullptr);
-    for (int row : {static_cast<int>(kChrome), static_cast<int>(kPotPlayer), static_cast<int>(kCounter)}) {
+    for (int row : {static_cast<int>(kChrome), static_cast<int>(kPotPlayer),
+                    static_cast<int>(kAutostart), static_cast<int>(kCounter)}) {
         toggles_[row] = CreateWindowExW(0, WC_BUTTONW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                         0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCtlBase + row)),
                                         inst, nullptr);
@@ -434,7 +466,8 @@ int SettingsWindow::RowAt(POINT pt) const {
 }
 
 void SettingsWindow::LayoutControls() {
-    for (int row : {static_cast<int>(kChrome), static_cast<int>(kPotPlayer), static_cast<int>(kCounter)}) {
+    for (int row : {static_cast<int>(kChrome), static_cast<int>(kPotPlayer),
+                    static_cast<int>(kAutostart), static_cast<int>(kCounter)}) {
         const RECT c = CardRect(row);
         // 56x32 around a 40x20 switch: room for the focus ring, with the switch's right edge
         // 16 px inside the card like the combobox's.
@@ -457,6 +490,7 @@ void SettingsWindow::Relabel() {
     // Owner-drawn buttons show no text; the names are for screen readers.
     SetWindowTextW(toggles_[kChrome], Tr(Txt::kChromeTitle));
     SetWindowTextW(toggles_[kPotPlayer], Tr(Txt::kPotPlayerTitle));
+    SetWindowTextW(toggles_[kAutostart], Tr(Txt::kAutostartTitle));
     SetWindowTextW(toggles_[kCounter], Tr(Txt::kCounterTitle));
 
     wchar_t autoText[96];
@@ -516,17 +550,23 @@ void SettingsWindow::Paint(HDC hdc) {
     };
     const RowText rows[kRowCount] = {{Txt::kChromeTitle, Txt::kChromeNote},
                                      {Txt::kPotPlayerTitle, Txt::kPotPlayerNote},
+                                     {Txt::kAutostartTitle, Txt::kAutostartNote},
                                      {Txt::kCounterTitle, Txt::kCounterNote},
                                      {Txt::kLanguageTitle, Txt::kLanguageNote}};
     for (int row = 0; row < kRowCount; ++row) {
         const RECT c = CardRect(row);
         const bool enabled = row != kPotPlayer;
+        // Task Manager > Startup apps overrides us and we do not fight it (nsp_autostart.h never
+        // writes StartupApproved). The row says so in grey and STAYS clickable: the user may still
+        // want the Run value added or removed, and only the shell decides whether it is honoured.
+        const bool blocked = row == kAutostart && autostart_ == AutostartState::kBlocked;
+        const Txt note = blocked ? Txt::kAutostartBlocked : rows[row].note;
         // Leave the control's column free: the switch is 56 px wide, the combobox 190.
         const int textRight = c.right - Px(row == kLanguage ? 16 + 190 + 12 : 64 + 8);
-        DrawLine(dc, gdi_.rowTitle, enabled ? kText : kTextDisabled,
+        DrawLine(dc, gdi_.rowTitle, (enabled && !blocked) ? kText : kTextDisabled,
                  RECT{c.left + Px(16), c.top + Px(11), textRight, c.top + Px(32)}, Tr(rows[row].title));
-        DrawLine(dc, gdi_.note, enabled ? kTextSecondary : kTextDisabled,
-                 RECT{c.left + Px(16), c.top + Px(33), textRight, c.top + Px(52)}, Tr(rows[row].note));
+        DrawLine(dc, gdi_.note, (enabled && !blocked) ? kTextSecondary : kTextDisabled,
+                 RECT{c.left + Px(16), c.top + Px(33), textRight, c.top + Px(52)}, Tr(note));
     }
 
     DrawLine(dc, gdi_.note, kTextSecondary, RECT{Px(kMargin + 2), Px(kFooterTop), right, Px(kFooterTop + 18)},
@@ -539,7 +579,11 @@ void SettingsWindow::Paint(HDC hdc) {
 void SettingsWindow::DrawToggle(const DRAWITEMSTRUCT& dis) {
     const int row = static_cast<int>(dis.CtlID) - kCtlBase;
     const bool enabled = (dis.itemState & ODS_DISABLED) == 0;
-    const bool on = enabled && (row == kChrome ? s_.captureChrome : row == kCounter && s_.showFpsCounter);
+    // kAutostart reads the cached registry state, never Settings: kBlocked draws as off, because
+    // off is what the shell will actually do with the entry.
+    const bool on = enabled && (row == kChrome        ? s_.captureChrome
+                                : row == kAutostart   ? autostart_ == AutostartState::kOn
+                                                      : row == kCounter && s_.showFpsCounter);
     const bool pressed = (dis.itemState & ODS_SELECTED) != 0;
     const bool focus = (dis.itemState & ODS_FOCUS) && !(dis.itemState & ODS_NOFOCUSRECT);
 
@@ -589,6 +633,21 @@ void SettingsWindow::DrawToggle(const DRAWITEMSTRUCT& dis) {
 }
 
 void SettingsWindow::Flip(int row) {
+    // Autostart first, and it returns: it is not part of Settings, so it must never reach
+    // onChange_ and never cause a settings.json write.
+    if (row == kAutostart) {
+        std::string err;
+        const bool want = autostart_ != AutostartState::kOn;
+        if (!AutostartSet(want, &err)) LogErr("settings window: %s", err.c_str());
+        // RE-READ, and this is the entire consistency guarantee: if the write failed, or Task
+        // Manager has the entry disabled, the switch snaps back to the truth instead of showing
+        // what the user asked for. Never assume the write took.
+        autostart_ = AutostartQuery();
+        InvalidateRect(hwnd_, nullptr, FALSE);  // the note line may have changed too
+        InvalidateRect(toggles_[row], nullptr, FALSE);
+        NotifyWinEvent(EVENT_OBJECT_STATECHANGE, toggles_[row], OBJID_CLIENT, CHILDID_SELF);
+        return;
+    }
     if (row == kChrome) {
         s_.captureChrome = !s_.captureChrome;
     } else if (row == kCounter) {

@@ -26,6 +26,15 @@ namespace nsp {
 void Log(const char* fmt, ...);
 void LogErr(const char* fmt, ...);
 
+// Both are ALSO teed, byte for byte, to
+//   %LOCALAPPDATA%\Nova SilkPlay\logs\silkplay-YYYYmmdd-HHMMSS.log   (UTF-8)
+// and the newest ten of those are kept. The build is /SUBSYSTEM:WINDOWS: an
+// instance started from the Run key has no console and no redirection, so this
+// file is the ONLY channel a diagnostic has and the only thing a beta bug
+// report can carry. On by default; SetFileLogging(false) stops it, and the file
+// is opened lazily so switching it off before the first Log() creates nothing.
+void SetFileLogging(bool on);
+
 std::string HrString(HRESULT hr);          // "0x80070057 (E_INVALIDARG)"
 std::string Narrow(const std::wstring& w);
 
@@ -65,6 +74,29 @@ double MonitorRefreshHz(const RECT& screenRect, bool* exact = nullptr);
 // Fastest refresh among all active monitors — what the desktop-wide DirectComposition
 // clock ticks at, and therefore the rate a window on a slower monitor must be paced down from.
 double DesktopMaxRefreshHz();
+
+// ----------------------------------------------------------------- processes
+
+// The FULL image path of `pid`, LOWER-CASE — e.g. L"c:\\program files\\google\\chrome.exe".
+// Opens the process with PROCESS_QUERY_LIMITED_INFORMATION only, which is what an
+// unelevated process gets for another process of the same user, and returns an EMPTY
+// string for one it may not open (a service, an elevated title, a pid that has just
+// exited). Callers must treat empty as "unknown", never as a match: the game gate
+// compares it against the Game Bar's MatchedExeFullPath list, where an empty path
+// simply means "not a known game", never "a candidate".
+// The full image path of a process, in the case Windows reports it: both this
+// and ProcessImageName reach the tray tooltip and the log, where
+// "potplayermini64.exe" instead of "PotPlayerMini64.exe" is a defect the user
+// can see. Empty for a process we may not open - never treat that as a match.
+std::wstring ProcessImagePath(DWORD pid);
+// The same path lower-cased, for comparing against a stored one such as the
+// Game Bar's MatchedExeFullPath.
+std::wstring ProcessImageNameLower(DWORD pid);
+
+// DWMWA_CLOAKED: the window is hidden by the shell (it lives on another virtual
+// desktop, or it is a suspended UWP app) while still answering IsWindowVisible.
+// False when DWM refuses to answer — the fail-open reading for every caller so far.
+bool IsCloaked(HWND hwnd);
 
 // ------------------------------------------------------------- target window
 

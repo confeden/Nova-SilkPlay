@@ -111,6 +111,10 @@ struct Overlay::Impl {
 
     HMODULE dcompDll = nullptr;
     ComPtr<IDCompositionDesktopDevice> dev;
+    // The same object through the original interface, which is the only one that
+    // carries CheckDeviceState. QI can fail on an old build; the check is then
+    // skipped rather than guessed at.
+    ComPtr<IDCompositionDevice> devLegacy;
     ComPtr<IDCompositionTarget> dcompTarget;
     ComPtr<IDCompositionVisual> visual;
     ComPtr<IDCompositionRectangleClip> clip;
@@ -121,6 +125,9 @@ struct Overlay::Impl {
 
     int lastCompositionMode = -1;
     HRESULT loggedPresentHr = S_OK;
+    int presentFails = 0;       // consecutive failed Present1 calls
+    int64_t lastDcompCheck = 0; // QPC of the last CheckDeviceState
+    bool dcompCheckLogged = false;  // the check is live: said once per engagement
     uint64_t presents = 0;
 
     std::string report;
@@ -236,6 +243,7 @@ void Overlay::Impl::Destroy() {
     clip.Reset();
     visual.Reset();
     dcompTarget.Reset();
+    devLegacy.Reset();
     dev.Reset();
 
     backRtv.Reset();
@@ -264,7 +272,18 @@ void Overlay::Impl::Destroy() {
         UnregisterClassW(kClassName, hinst);
         ownsClass = false;
     }
-    dcompDll = nullptr;  // deliberately left loaded
+    // Left loaded deliberately - dcomp.dll stays in the process for the life of
+    // the run and reloading it per engage buys nothing - but the HANDLE is
+    // released, because dropping it without FreeLibrary added one reference on
+    // every engage and a long session engages hundreds of times (beta audit,
+    // 2026-09-20). The module stays loaded; only our own count is balanced.
+    if (dcompDll) {
+        FreeLibrary(dcompDll);
+        dcompDll = nullptr;
+    }
+    lastDcompCheck = 0;
+    dcompCheckLogged = false;
+    presentFails = 0;
 }
 
 // ============================================================================
@@ -537,6 +556,9 @@ bool Overlay::Create(HWND target, const RECT& hwndRectScreen, const RECT& videoR
     if (!d.dev && create2) hrD = create2(dxgiDevice.Get(), IID_PPV_ARGS(&d.dev));
     if (!d.dev) return fail("no IDCompositionDesktopDevice", hrD);
 
+    if (FAILED(d.dev.As(&d.devLegacy)))
+        LogErr("IDCompositionDevice unavailable - a DWM restart will not be detected");
+
     hr = d.dev->CreateTargetForHwnd(d.hwnd, TRUE, &d.dcompTarget);
     if (FAILED(hr)) return fail("CreateTargetForHwnd failed", hr);
 
@@ -661,14 +683,59 @@ bool Overlay::Present() {
             d.loggedPresentHr = hr;
             LogErr("Overlay::Present: Present1 failed %s (logged once)", HrString(hr).c_str());
         }
+        // One failed present is a hiccup and the next tick will try again. A RUN
+        // of them is not: the picture on screen is then frozen over live video
+        // while we keep reporting success, which is the fail-open I10 forbids.
+        // Eight in a row is ~50 ms at 165 Hz - short enough that the user sees a
+        // stutter rather than a still, long enough that a single lost frame
+        // never re-engages us (beta audit, 2026-09-20).
+        if (++d.presentFails >= 8) {
+            LogErr("Overlay::Present: %d presents in a row failed - treating the device as lost",
+                   d.presentFails);
+            d.presentFails = 0;
+            return false;
+        }
         return true;
     }
+    d.presentFails = 0;
     ++d.presents;
 
     if (d.media) {
         DXGI_FRAME_STATISTICS_MEDIA fsm = {};
         if (SUCCEEDED(d.media->GetFrameStatisticsMedia(&fsm)))
             d.lastCompositionMode = static_cast<int>(fsm.CompositionMode);
+    }
+
+    // IS ANYONE STILL COMPOSING WHAT WE PRESENT? A DWM restart or a display
+    // topology change invalidates the DirectComposition device, and nothing
+    // says so: the swapchain is ours, Present1 keeps returning S_OK, and the
+    // overlay simply stops appearing on screen (beta audit, 2026-09-20). The
+    // device itself answers the question; ask it twice a second, which is far
+    // enough from the 165 Hz present loop to cost nothing.
+    if (d.devLegacy) {
+        const int64_t now = QpcNow();
+        if (d.lastDcompCheck == 0) d.lastDcompCheck = now;
+        if (QpcToSec(now - d.lastDcompCheck) >= 0.5) {
+            d.lastDcompCheck = now;
+            BOOL valid = TRUE;
+            const HRESULT ck = d.devLegacy->CheckDeviceState(&valid);
+            // Say once per engagement that the check is actually live. Getting
+            // IDCompositionDevice by QI from IDCompositionDesktopDevice, and
+            // that legacy object reflecting the same device's state, are both
+            // undocumented; without this line a check that silently never runs
+            // would be indistinguishable from one that always passes.
+            if (!d.dcompCheckLogged) {
+                d.dcompCheckLogged = true;
+                Log("DComp device state check live: %s, valid=%d", HrString(ck).c_str(),
+                    valid ? 1 : 0);
+            }
+            if (FAILED(ck) || !valid) {
+                LogErr("Overlay::Present: the DirectComposition device is no longer valid "
+                       "(%s) - nothing we present is being composed, re-engaging",
+                       HrString(ck).c_str());
+                return false;
+            }
+        }
     }
     return true;
 }

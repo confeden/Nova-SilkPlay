@@ -174,6 +174,12 @@ def screenshot_on_failure(cdp, path):
 
 
 def open_fullscreen(a, W, H, X=0, Y=0):
+    # ABSOLUTE, always. Chrome ignores a relative --user-data-dir and falls back to the
+    # user's DEFAULT profile, so the launch silently joins their already-running browser:
+    # no throwaway profile is created, no DevToolsActivePort is ever written, every arm
+    # times out - and the URL opens as a tab in THEIR window. MEASURED 2026-09-20 with
+    # --out runs/beta-0920; the same command with an absolute profile path works.
+    a.profile = os.path.abspath(a.profile)
     stale = os.path.join(a.profile, "DevToolsActivePort")
     if os.path.exists(stale):
         os.remove(stale)

@@ -16,7 +16,10 @@
 //     That is a known, accepted defect at prototype stage — see D23.
 
 #include "nsp_capture.h"
+#include "nsp_autostart.h"
 #include "nsp_common.h"
+#include "nsp_drm.h"
+#include "nsp_gamegate.h"
 #include "nsp_dump.h"
 #include "nsp_image.h"
 #include "nsp_offline.h"
@@ -30,6 +33,7 @@
 #include "nsp_winwatch.h"
 
 #include <dwmapi.h>
+#include <dxgi.h>      // the render adapter's LUID, for the game gate
 #include <shellapi.h>  // CommandLineToArgvW
 
 #include <objbase.h>
@@ -108,8 +112,17 @@ struct AppOptions {
     std::vector<std::wstring> occlusionIgnore;  // --occlusion-ignore a.exe,b.exe (lower-case)
     bool   listWindows = false;
     bool   listDisplays = false;
+    double gateProbeSec = 0.0;   // --game-gate-probe N: watch the gate for N seconds, then exit
     bool   badge = true;         // the "24/165" readout in the top-right corner of the video
     bool   badgeFromCli = false; // --no-badge given: the Settings counter switch does not override it
+    // P6: pause generation while a game has the GPU (I1, I2, D3). Off only for
+    // an A/B against another frame generator, which is itself a fullscreen GPU
+    // load and would otherwise stop us the moment it starts.
+    bool   gameGate = true;      // --no-game-gate
+    // P11 / I7: protected video is recognised and SKIPPED. Off only for a
+    // measurement run, which must not be silently gated by a browser state the
+    // measurement did not ask about.
+    bool   drmGate = true;       // --no-drm-gate
     int    cellPx = 8;           // motion field cell, full-res pixels
     // MEASURED default. On the first real corpus — Meridian 59.94p decimated to
     // stride 2, 49 triples, each middle frame withheld as ground truth — NVOFA
@@ -196,6 +209,18 @@ void PrintUsage() {
         "  --log-dirty              one line per capture: damage, content test, verdict\n"
         "  --no-badge               no source/output fps readout in the top-right\n"
         "                           corner (needed for a bit-exact passthrough check)\n"
+        "  --no-drm-gate            generate even when the browser has a content decryption\n"
+        "                           module running (measurement runs only - I7 says\n"
+        "                           protected video is skipped)\n"
+        "  --game-gate-probe N      watch the game gate for N seconds and exit: no window,\n"
+        "                           no overlay, no capture, so it can run for hours beside\n"
+        "                           ordinary work to prove it never pauses by mistake\n"
+        "  --console                open a console for this run; implied by every switch\n"
+        "                           that prints (the build is windowless, so autostart\n"
+        "                           never flashes one)\n"
+        "  --no-game-gate           keep generating while a game runs (A/B runs only)\n"
+        "  --nudge-hotkeys          claim Ctrl+Alt+arrows to nudge the source offset by a\n"
+        "                           pixel (alignment aid; off, so the chords stay free)\n"
         "  --warp-lab N             warp laboratory: branch maps / ablations (P21)\n"
         "  --field-lab N            per-pair field coherence lab (P21)\n"
         "  --no-field-cohere        turn off the per-pair field coherence pass (P21)\n"
@@ -239,6 +264,13 @@ std::wstring Widen(const char* s) {
     return out;
 }
 
+// The four arrows nudge the capture's source offset by a pixel: an alignment
+// tool, not a feature, and Ctrl+Alt+<arrow> is a combination other software
+// (Intel's display rotation, several editors) also claims. A shipping run must
+// not take four global chords away from the machine for a lab switch, so they
+// are off unless --nudge-hotkeys asks for them.
+bool g_nudgeHotkeys = false;
+
 bool ParseArgs(int argc, char** argv, AppOptions* opt) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -253,6 +285,8 @@ bool ParseArgs(int argc, char** argv, AppOptions* opt) {
             return false;
         } else if (a == "--list-displays") {
             opt->listDisplays = true;
+        } else if (a == "--game-gate-probe" && next(&v)) {
+            opt->gateProbeSec = atof(v);
         } else if (a == "--list-windows") {
             opt->listWindows = true;
         } else if (a == "--target-class" && next(&v)) {
@@ -365,6 +399,15 @@ bool ParseArgs(int argc, char** argv, AppOptions* opt) {
         } else if (a == "--no-badge") {
             opt->badge = false;
             opt->badgeFromCli = true;
+        } else if (a == "--nudge-hotkeys") {
+            g_nudgeHotkeys = true;
+        } else if (a == "--no-game-gate") {
+            opt->gameGate = false;
+        } else if (a == "--no-drm-gate") {
+            opt->drmGate = false;
+        } else if (a == "--console") {
+            // Handled before the options are parsed; accepted here so it is not
+            // reported as unknown.
         } else if (a == "--settings-file" && next(&v)) {
             opt->settingsFile = v;
         } else if (a == "--default-settings") {
@@ -695,10 +738,10 @@ int HotkeyIdForVk(DWORD vk) {
         case 'O': return kHkToggle;
         case 'M': return kHkMode;
         case 'X': return kHkQuit;
-        case VK_LEFT: return kHkLeft;
-        case VK_RIGHT: return kHkRight;
-        case VK_UP: return kHkUp;
-        case VK_DOWN: return kHkDown;
+        case VK_LEFT: return g_nudgeHotkeys ? kHkLeft : 0;
+        case VK_RIGHT: return g_nudgeHotkeys ? kHkRight : 0;
+        case VK_UP: return g_nudgeHotkeys ? kHkUp : 0;
+        case VK_DOWN: return g_nudgeHotkeys ? kHkDown : 0;
         default: return 0;
     }
 }
@@ -713,16 +756,47 @@ int HotkeyIdForVk(DWORD vk) {
 //
 // This hook looks at nothing else: any key without both Ctrl and Alt down, or
 // any key that is not one of ours, is passed straight through untouched.
+//
+// TWO RULES that are not optional, both found by the beta audit (2026-09-20):
+//
+// 1. RIGHT ALT IS NOT OUR ALT. On every European layout AltGr is delivered as
+//    Ctrl+RightAlt, and AltGr+<key> is how those users type @ { } [ ] \ and
+//    their own letters. A hook that consumes Ctrl+Alt+Q would make Q
+//    untypeable on such a layout for as long as we run — machine-wide, in every
+//    other program. So the chord counts only with the LEFT Alt down and the
+//    right one up. The cost is that Ctrl+RightAlt+Q does not toggle generation;
+//    that is the correct trade.
+//
+// 2. AUTOREPEAT IS NOT A SECOND PRESS. Held down, Windows repeats a key ~30
+//    times a second; each repeat used to post another toggle, so holding
+//    Ctrl+Alt+Q strobed the overlay on and off. Only the transition counts, so
+//    the down state of each chord is tracked here and cleared on key-up. The
+//    key-up is swallowed too: having eaten the down, letting the up through
+//    would leave other programs believing the key is still held.
+bool g_chordDown[kHkQuit + 1] = {};
+
 LRESULT CALLBACK LowLevelKeyProc(int code, WPARAM wp, LPARAM lp) {
-    if (code == HC_ACTION && (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)) {
+    if (code == HC_ACTION) {
         const auto* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
-        const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-        const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-        if (ctrl && alt) {
-            const int id = HotkeyIdForVk(k->vkCode);
-            if (id != 0) {
-                PostThreadMessageW(g_mainThread, WM_NSP_HOTKEY, static_cast<WPARAM>(id), 0);
-                return 1;  // swallowed: nobody else gets this combination
+        const int id = HotkeyIdForVk(k->vkCode);
+        if (id != 0 && id <= kHkQuit) {
+            if (wp == WM_KEYUP || wp == WM_SYSKEYUP) {
+                if (g_chordDown[id]) {
+                    g_chordDown[id] = false;
+                    return 1;  // we ate the down; the up belongs to us too
+                }
+            } else if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) {
+                const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                const bool lalt = (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0;
+                const bool ralt = (GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
+                if (ctrl && lalt && !ralt) {
+                    if (!g_chordDown[id]) {
+                        g_chordDown[id] = true;
+                        PostThreadMessageW(g_mainThread, WM_NSP_HOTKEY,
+                                           static_cast<WPARAM>(id), 0);
+                    }
+                    return 1;  // swallowed: nobody else gets this combination
+                }
             }
         }
     }
@@ -791,6 +865,11 @@ void RegisterHotkeysFallback() {
         {kHkDown, VK_DOWN, "Ctrl+Alt+Down"},     {kHkQuit, 'X', "Ctrl+Alt+X quit"},
     };
     for (const auto& k : keys) {
+        // Same rule as the hook: the arrows are a lab tool and are not claimed
+        // machine-wide unless asked for.
+        if (!g_nudgeHotkeys &&
+            (k.id == kHkLeft || k.id == kHkRight || k.id == kHkUp || k.id == kHkDown))
+            continue;
         if (!RegisterHotKey(nullptr, k.id, mods, k.vk))
             LogErr("RegisterHotKey(%s) failed, GetLastError=%lu (key unavailable)", k.name,
                    GetLastError());
@@ -821,6 +900,15 @@ void UninstallHotkeys() {
 // tray icon stays behind as a dead entry until the pointer passes over it.
 std::atomic<bool> g_consoleQuit{false};
 HANDLE g_runDone = nullptr;  // set once the main loop has cleaned up
+
+// ASK US TO QUIT FROM ANOTHER PROCESS. The build is /SUBSYSTEM:WINDOWS, so it
+// has no console and GenerateConsoleCtrlEvent can no longer reach it - which is
+// how every harness used to stop it, and how a script would otherwise be left
+// with TerminateProcess and a tray icon nobody removed. Any tool can now do
+//   SetEvent(OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Local\\NovaSilkPlay.Quit"))
+// and the loop leaves by the same path as Ctrl+Alt+X.
+constexpr wchar_t kQuitEventName[] = L"Local\\NovaSilkPlay.Quit";
+HANDLE g_quitEvent = nullptr;
 
 BOOL WINAPI OnConsoleCtrl(DWORD type) {
     g_consoleQuit.store(true);
@@ -855,7 +943,7 @@ private:
     void LogStats();
     bool DoDump();
     // "<source fps>/<output fps>" for the readout.
-    std::string FpsText() const;
+    std::wstring FpsText() const;
     // A change made in the Settings window, applied between ticks.
     void ApplySettings(const Settings& s);
     // The tray icon's hover text: what the engine is doing right now, in the user's language.
@@ -881,6 +969,19 @@ private:
     bool wantShown_ = true;    // what the user asked for (Ctrl+Alt+O)
     bool stalled_ = true;      // no source frame recently -> overlay hidden
     bool obscured_ = false;    // another window is over the video -> paused (I10)
+    // P6, the game gate. gamePaused_ mirrors the sampler's verdict on the engine
+    // thread so every consumer sees one value for a whole iteration.
+    GameGate gameGate_;
+    bool gamePaused_ = false;
+    int64_t gamePausedAt_ = 0;
+    bool gameYielded_ = false;  // we disengaged to hand the device back to the game
+    GameSignal gameSignal_ = GameSignal::kNone;
+    std::wstring gameExe_;
+    // P11. Unlike the game gate this one fails CLOSED: anything but a clear
+    // verdict means we do not put a picture on the screen.
+    DrmWatch drm_;
+    bool drmBlocked_ = false;
+    DrmSignal drmSignal_ = DrmSignal::kNone;
     bool cursorOver_ = false;  // only with the cursor gate on: pointer on the video -> paused
     bool cursorGateTripped_ = false;  // the overlay took hit tests: input was being swallowed
     int64_t lastObscuredCheck_ = 0;
@@ -929,6 +1030,17 @@ private:
     double motionCpuMs_ = 0.0;  // CPU time submitting the estimate, not GPU time
     uint64_t motionRuns_ = 0;
     uint64_t reengageFails_ = 0;
+    // True when the last failed Engage() got past ResolveTarget and had already
+    // started building the overlay, the synth and the capture. Waiting for a
+    // browser is cheap and must stay responsive at one attempt a second; a
+    // target that exists but cannot be engaged is a real fault, usually a
+    // persistent one, and retrying the whole GPU build once a second for ever
+    // is how a background tool ends up pinned at the top of Task Manager (beta
+    // audit, 2026-09-20).
+    bool engageCostly_ = false;
+    int64_t engagedAtQpc_ = 0;  // when the last successful Engage() finished
+    uint64_t costlyFails_ = 0;  // only the expensive kind, for the backoff
+    bool faultDisengage_ = false;  // this Disengage is a fault, not a decision
     Tray tray_;
     int64_t lastTrayStatus_ = 0;
 };
@@ -1038,6 +1150,19 @@ bool App::Engage() {
         LogErr("synth creation failed: %s", err.c_str());
         return false;
     }
+    // The gate must know our adapter (this machine exposes a second render device
+    // whose engines would otherwise be counted) and the captured tree, which is
+    // exempt by construction so our own overlay can never gate us off (N14).
+    {
+        Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDev;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        DXGI_ADAPTER_DESC ad{};
+        if (SUCCEEDED(overlay_->Device()->QueryInterface(IID_PPV_ARGS(&dxgiDev))) &&
+            SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&ad)))
+            gameGate_.SetAdapterLuid(ad.AdapterLuid);
+        gameGate_.SetTargetPid(target_.pid);
+    }
+    drm_.SetTargetPid(target_.pid);
     synth_->SetOcclusionMode(opt_.occMode);
     synth_->SetFieldCohere(opt_.fieldCohere);
     synth_->SetOfaSeedHints(opt_.ofaSeedHints);
@@ -1116,6 +1241,39 @@ bool App::Engage() {
 }
 
 void App::Disengage() {
+    // A FAULT THAT KILLS A FRESH ENGAGEMENT FEEDS THE BACKOFF. Rebuilding the
+    // device, the overlay, the shaders and the capture session once a second for
+    // ever is what a persistently invalid DComp device or a swapchain that will
+    // not give up a back buffer used to cause: Engage succeeded, Tick killed it
+    // half a second later, and the retry clock had just been reset (review,
+    // 2026-09-20). An engagement that HELD is not evidence of anything, so it
+    // clears the count instead.
+    if (engaged_ && faultDisengage_) {
+        const bool shortLived =
+            engagedAtQpc_ != 0 && QpcToSec(QpcNow() - engagedAtQpc_) < 5.0;
+        if (shortLived) {
+            engageCostly_ = true;
+            ++costlyFails_;
+        } else {
+            engageCostly_ = false;
+            costlyFails_ = 0;
+        }
+    }
+    faultDisengage_ = false;
+    engagedAtQpc_ = 0;
+    // THE EXEMPTION IS NEVER DROPPED HERE, and the reason is a circular deadlock
+    // found in review (2026-09-20). Disengage runs on every geometry change -
+    // including the one the user makes constantly, pressing F11 on a video. For
+    // the second between that Disengage and the next Engage, Chrome is a foreign
+    // FULLSCREEN FOREGROUND window with no exemption, and a fullscreen re-layout
+    // is exactly when its GPU load peaks: the gate could arm it, cross 35 % for
+    // two samples, and publish "paused". gamePaused_ then blocks the re-engage
+    // that is the only thing which would restore the exemption, and the resume
+    // rule never fires because fullscreen video keeps the load above 12 %. The
+    // result was frame generation dead until restart, with the tray saying a
+    // game was running and naming chrome.exe. Keeping the last target exempt
+    // while disengaged costs nothing and fails OPEN, which is the gate's first
+    // contract. The pid is replaced by the next Engage.
     if (overlay_) overlay_->Hide();
     zFixesAtStats_ = 0;
     framesAtStats_ = 0;
@@ -1175,6 +1333,7 @@ void App::Tick() {
 
     if (capture_->NeedsReengage()) {
         Log("capture asked for a re-engage");
+        faultDisengage_ = true;
         Disengage();
         return;
     }
@@ -1220,7 +1379,16 @@ void App::Tick() {
     // near-identical frames is work with no output. Observed live, and it is
     // the same class of error I8 exists for. Threshold: a source period under
     // 1.5 output ticks.
-    const double outTick = outFpsSmooth_ > 30.0 ? 10000000.0 / outFpsSmooth_ : 60600.0;
+    // THE OUTPUT PERIOD IS KNOWN, NOT MEASURED. This used to divide by the
+    // measured present rate, which is 0 for the first half second of every
+    // engage and then feeds back on itself: with the fallback standing in for
+    // 165 Hz, a 60 fps source on the 60 Hz secondary was interpolated until the
+    // measurement caught up, then stopped, then started again (beta audit,
+    // 2026-09-20). The refresh of the monitor the video is on is read at Engage
+    // and re-read whenever the window moves or the mode changes (I14), so it is
+    // right from the first tick and cannot oscillate.
+    const double outHz = rateGate_ ? targetHz_ : desktopMaxHz_;
+    const double outTick = outHz > 1.0 ? 10000000.0 / outHz : 60600.0;
     const bool sourceIsFast = period > 0.0 && period < outTick * 1.5;
     const bool usePair =
         havePair && period > 0.0 && !sourceIsFast && opt_.mode != Mode::Passthrough;
@@ -1288,21 +1456,33 @@ void App::Tick() {
     // the generated rate at the rate that is actually scanned out.
     const int64_t nowQpc = QpcNow();
     if (rateGate_) {
-        const int64_t period = static_cast<int64_t>(QpcPerSecond() / targetHz_);
+        // gatePeriod, not "period": the enclosing scope already has a SOURCE
+        // period in 100 ns units, and the two used to share a name.
+        const int64_t gatePeriod = static_cast<int64_t>(QpcPerSecond() / targetHz_);
         if (nextPresentQpc_ == 0) {
             nextPresentQpc_ = nowQpc;
-        } else if (nowQpc < nextPresentQpc_ - period / 4) {
+        } else if (nowQpc < nextPresentQpc_ - gatePeriod / 4) {
             ++gateSkips_;
             return;  // too early for this output: capture was polled, present is not due
         }
-        nextPresentQpc_ += period;
+        nextPresentQpc_ += gatePeriod;
         // Never accumulate a backlog: after a stall, restart from now.
-        if (nextPresentQpc_ < nowQpc - period) nextPresentQpc_ = nowQpc + period;
+        if (nextPresentQpc_ < nowQpc - gatePeriod) nextPresentQpc_ = nowQpc + gatePeriod;
     }
 
     ID3D11Texture2D* back = nullptr;
     ID3D11RenderTargetView* rtv = nullptr;
-    if (!overlay_->AcquireBackBuffer(&back, &rtv)) return;
+    if (!overlay_->AcquireBackBuffer(&back, &rtv)) {
+        // A back buffer we cannot get is a lost device, not a skipped frame.
+        // This used to `return`, which left the engine "engaged" for ever after a
+        // TDR: every tick failed here, nothing re-engaged, and the last picture
+        // stayed frozen over live video until the user quit (beta audit,
+        // 2026-09-20). Present() already treats its own failure this way.
+        LogErr("back buffer unavailable - the device is lost, re-engaging");
+        faultDisengage_ = true;
+        Disengage();
+        return;
+    }
 
     if (usePair) {
         const UINT vw = static_cast<UINT>(RectW(overlay_->VideoRect()));
@@ -1321,14 +1501,20 @@ void App::Tick() {
     if (opt_.badge && overlay_->IsShown()) {
         const UINT vw = static_cast<UINT>(RectW(overlay_->VideoRect()));
         const UINT vh = static_cast<UINT>(RectH(overlay_->VideoRect()));
-        // Fixed: the top-right corner of the video rect, 12 px in, twice the
-        // 5x7 font at 1080p and three times from 1440p up.
-        const int scale = vh >= 1400 ? 3 : 2;
-        synth_->DrawFpsText(rtv, vw, vh, static_cast<float>(vw) - 12.0f, 12.0f, scale, FpsText());
+        // Fixed: the top-right corner of the video rect, 12 px in. The size
+        // follows the picture so it reads the same on a 1080p secondary and a
+        // 1440p primary, and it is deliberately small — the readout is a check,
+        // not a feature of the picture (owner, 2026-09-20). MEASURED with Segoe
+        // UI Semibold: 1080p -> 13 px font -> 9 px digits, 1440p -> 16 -> 11,
+        // 2160p -> the 20 px cap -> 14. The pixel font it replaced was 21 px
+        // tall at 1440p, so this is about half.
+        const int fontPx = (std::min)(20, (std::max)(13, static_cast<int>(vh) / 90));
+        synth_->DrawFpsText(rtv, vw, vh, static_cast<float>(vw) - 12.0f, 12.0f, fontPx, FpsText());
     }
 
     if (!overlay_->Present()) {
         LogErr("device lost on present - re-engaging");
+        faultDisengage_ = true;
         Disengage();
         return;
     }
@@ -1390,7 +1576,8 @@ void App::Tick() {
     // cadence_.Ready() is also the "is anything actually animating" test: a static
     // page delivers the odd repaint a second apart, which is not a source to
     // interpolate and must not make the overlay blink in and out.
-    if (opt_.autoShow && wantShown_ && !stalled_ && !obscured_ && !cursorOver_ &&
+    if (opt_.autoShow && wantShown_ && !stalled_ && !obscured_ && !cursorOver_ && !gamePaused_ &&
+        !drmBlocked_ &&
         !overlay_->IsShown() && havePair &&
         cadence_.Ready()) {
         overlay_->Show();
@@ -1399,8 +1586,10 @@ void App::Tick() {
     }
 }
 
-std::string App::FpsText() const {
-    return std::to_string(shownSrcFps_) + "/" + std::to_string(shownOutFps_);
+// "24 → 165", the same wording as the tray tooltip. An arrow, not a slash:
+// the two numbers are a source and what it becomes, not a fraction.
+std::wstring App::FpsText() const {
+    return std::to_wstring(shownSrcFps_) + L" → " + std::to_wstring(shownOutFps_);
 }
 
 void App::ApplySettings(const Settings& s) {
@@ -1444,6 +1633,13 @@ std::wstring App::TrayStatus() const {
         _snwprintf_s(text, _TRUNCATE, L"%ls", Tr(Txt::kStatusSettingsUnreadable));
     } else if (!opt_.targetFromCli && !settings_.captureChrome) {
         _snwprintf_s(text, _TRUNCATE, L"%ls", Tr(Txt::kStatusNothingSelected));
+    } else if (drmBlocked_) {
+        _snwprintf_s(text, _TRUNCATE, L"%ls", Tr(Txt::kStatusProtected));
+    } else if (gamePaused_) {
+        // Above the !engaged_ branch on purpose: a gate YIELD disengages us, and
+        // "waiting for fullscreen video" would be a lie while a game is running.
+        _snwprintf_s(text, _TRUNCATE, Tr(Txt::kStatusGamePaused),
+                     gameExe_.empty() ? L"?" : gameExe_.c_str());
     } else if (!engaged_) {
         _snwprintf_s(text, _TRUNCATE, Tr(Txt::kStatusWaiting), app.c_str());
     } else if (obscured_) {
@@ -1515,7 +1711,8 @@ bool App::DoDump() {
     synth_->Warp(rtv.Get(), w, h, capture_->PreviousSrv(), capture_->NewestSrv(), 0.5f);
     DumpTextureToPpm(dev, ctx, rt.Get(), (p + "_mc50.ppm").c_str());
     if (opt_.badge) {
-        synth_->DrawFpsText(rtv.Get(), w, h, static_cast<float>(w) - 12.0f, 12.0f, h >= 1400 ? 3 : 2,
+        const int dumpFontPx = (std::min)(20, (std::max)(13, static_cast<int>(h) / 90));
+        synth_->DrawFpsText(rtv.Get(), w, h, static_cast<float>(w) - 12.0f, 12.0f, dumpFontPx,
                             FpsText());
         DumpTextureToPpm(dev, ctx, rt.Get(), (p + "_fps.ppm").c_str());
     }
@@ -1621,6 +1818,25 @@ int App::Run() {
     if (!watch_.Start())
         LogErr("window events unavailable (SetWinEventHook failed) - covering windows are "
                "found by the 10 Hz poll only");
+    // P6. FAIL OPEN: a gate that cannot measure must never stop a video (I2), so
+    // a refusal here is loud and the run continues generating.
+    if (opt_.gameGate) {
+        std::string gerr;
+        if (!gameGate_.Start(&gerr))
+            LogErr("game gate unavailable (%s) - generation will NOT pause for games this run",
+                   gerr.c_str());
+    } else {
+        Log("game gate OFF (--no-game-gate) - generation will not pause for a game");
+    }
+    if (opt_.drmGate) {
+        std::string derr;
+        if (!drm_.Start(&derr))
+            LogErr("DRM watch unavailable (%s) - generation is BLOCKED, because a watch that "
+                   "cannot tell must not let us draw over protected video (I7)",
+                   derr.c_str());
+    } else {
+        Log("DRM gate OFF (--no-drm-gate) - protected video would NOT be skipped");
+    }
     {
         std::string trayErr;
         if (!tray_.Create(settings_, settingsPath_, opt_.uiMonitor, &trayErr))
@@ -1738,6 +1954,10 @@ int App::Run() {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        if (!quit_ && g_quitEvent && WaitForSingleObject(g_quitEvent, 0) == WAIT_OBJECT_0) {
+            Log("quit requested through %ls - shutting down", kQuitEventName);
+            quit_ = true;
+        }
         if (!quit_ && g_consoleQuit.load()) {
             Log("console closed or Ctrl+C - quitting");
             quit_ = true;
@@ -1801,6 +2021,94 @@ int App::Run() {
                 cursorOver_ = false;
                 Log("pointer left the video - generation resumes");
             }
+        }
+
+        // A foreground change is what the gate most wants to know about, and the
+        // watcher already sees it. Its own flag, never the occlusion test's: a
+        // shared one would let whichever consumer polled first swallow the
+        // other's notification.
+        if (opt_.gameGate && watch_.TakeForegroundChanged()) gameGate_.NudgeForeground();
+
+        // THE DRM GATE (P11, I7). It decides whether a PICTURE may be shown, never
+        // whether we may engage - gating the engage would deadlock exactly the way
+        // the game gate's exemption did, because the scanner needs a target pid to
+        // reach a clear verdict and only Engage gives it one.
+        //
+        // FAILS CLOSED, the opposite of the game gate: kUnknown counts as
+        // protected. Generating over content somebody encrypted is the failure
+        // this exists to prevent; refusing to smooth one page is not.
+        //
+        // WHAT IS WIRED, and what is not: only the process scan. A content
+        // decryption module running anywhere in the browser's tree blocks
+        // generation for that browser. That is deliberately coarse - a Netflix tab
+        // left open in the BACKGROUND blocks generation on the YouTube tab in
+        // front - and it is the conservative direction I7 asks for. The dead-
+        // picture half of the design (DrmWatch::OnPictureSummary) is NOT called:
+        // its thresholds cannot be honest without measuring real protected
+        // playback, and the owner has no subscription to measure against
+        // (2026-09-20). Both halves stay `unverified` until that run happens.
+        if (opt_.drmGate) {
+            const DrmStatus ds = drm_.Status();
+            const bool blocked = !ds.ok || ds.verdict != DrmVerdict::kClear;
+            if (blocked != drmBlocked_) {
+                drmBlocked_ = blocked;
+                drmSignal_ = ds.signal;
+                lastTrayStatus_ = 0;
+                if (drmBlocked_) {
+                    if (overlay_) overlay_->Hide();
+                    Log("DRM gate: %s (pid %lu, %d children unreadable) - not generating over "
+                        "protected video",
+                        DrmSignalName(ds.signal), ds.cdmPid, ds.unreadableChildren);
+                } else {
+                    Log("DRM gate: clear - generation resumes");
+                }
+            }
+        }
+
+        // THE GAME GATE (P6, I1, I2, D3). Read once per iteration so every
+        // consumer below sees one verdict, and placed BEFORE the occlusion test
+        // so a game wins both the log line and the tray tooltip over a window
+        // that merely covers the video.
+        if (opt_.gameGate) {
+            const GameGateStatus gs = gameGate_.Status();
+            // !Ok() is CLEAR, never a held pause: when the instrument gives up
+            // mid-run the video must keep playing (contract 1 of nsp_gamegate.h).
+            const bool nowGame = gameGate_.Ok() && gs.verdict == GateVerdict::kPaused;
+            if (nowGame != gamePaused_) {
+                gamePaused_ = nowGame;
+                gameSignal_ = gs.signal;
+                gameExe_ = gs.exe;
+                lastTrayStatus_ = 0;  // push the new tooltip at once
+                if (gamePaused_) {
+                    gamePausedAt_ = now;
+                    if (overlay_) overlay_->Hide();
+                    Log("game gate: %s pid %lu %s at %.0f%% of the 3D engine - generation PAUSED",
+                        GameSignalName(gs.signal), gs.pid, Narrow(gs.exe).c_str(), gs.utilPct);
+                } else {
+                    Log("game gate: clear - generation resumes");
+                    gameYielded_ = false;
+                }
+            }
+            // YIELD. Ten seconds in, the game wants the few hundred megabytes and
+            // the capture session we are still holding for a video nobody can see.
+            if (gamePaused_ && engaged_ && !gameYielded_ &&
+                QpcToSec(now - gamePausedAt_) > 10.0) {
+                Log("game gate: 10 s paused - releasing the capture session and the device");
+                gameYielded_ = true;
+                Disengage();
+            }
+        }
+
+        // OFF MEANS OFF. Turning generation off used to hide the overlay and
+        // leave the whole pipeline running: WGC still delivered frames, motion
+        // was still estimated once a pair and a frame was still synthesized and
+        // presented on every compositor tick, all of it invisible (beta audit,
+        // 2026-09-20). A tray utility the user has switched off must not keep a
+        // capture session and a few hundred megabytes of GPU memory, and must
+        // not heat the machine for a picture nobody sees.
+        if (!wantShown_ && engaged_) {
+            Log("frame generation is off - releasing the capture session and the device");
+            Disengage();
         }
 
         // THE OCCLUSION TEST — owner's rule: while ANY window covers even part of
@@ -1906,13 +2214,20 @@ int App::Run() {
                 Disengage();
             }
             if (engaged_ && overlay_) {
+                // BOTH rates, every time. The desktop maximum used to be re-read
+                // only when the video's own monitor changed rate, so plugging in
+                // a faster display left rateGate_ off and the engine presented at
+                // the compositor's new 165 Hz onto a 60 Hz output - generating
+                // above the refresh, which I14 forbids (beta audit, 2026-09-20).
                 bool exact = false;
                 const double hz = MonitorRefreshHz(overlay_->VideoRect(), &exact);
-                if (hz > 1.0 && fabs(hz - targetHz_) > 0.5) {
-                    desktopMaxHz_ = DesktopMaxRefreshHz();
+                const double maxHz = DesktopMaxRefreshHz();
+                if (hz > 1.0 && (fabs(hz - targetHz_) > 0.5 || fabs(maxHz - desktopMaxHz_) > 0.5)) {
+                    const double oldMax = desktopMaxHz_;
+                    desktopMaxHz_ = maxHz;
                     rateGate_ = hz < desktopMaxHz_ - 1.0;
-                    Log("output refresh changed %.3f -> %.3f Hz (desktop max %.3f) - generation %s",
-                        targetHz_, hz, desktopMaxHz_,
+                    Log("output refresh %.3f -> %.3f Hz (desktop max %.3f -> %.3f) - generation %s",
+                        targetHz_, hz, oldMax, maxHz,
                         rateGate_ ? "paced down to this monitor" : "follows the compositor clock");
                     targetHz_ = hz;
                     nextPresentQpc_ = 0;
@@ -1922,9 +2237,20 @@ int App::Run() {
 
         // Not while a window is being dragged or sized: every attempt would build a
         // device, an overlay and a capture session for a rect that is about to move.
-        if (!engaged_ && !watch_.MoveSizeActive() && QpcToSec(now - lastReengageAttempt) > 1.0) {
+        // The backoff counts only EXPENSIVE failures. reengageFails_ also counts
+        // "Chrome is not running yet", which a background tool does hundreds of
+        // times an hour; using it here meant the first real failure jumped
+        // straight to the 10 s ceiling (review, 2026-09-20).
+        const double reengageAfter =
+            engageCostly_ ? (std::min)(10.0, 1.0 + 0.5 * static_cast<double>(costlyFails_)) : 1.0;
+        if (!engaged_ && wantShown_ && !gamePaused_ && !watch_.MoveSizeActive() &&
+            QpcToSec(now - lastReengageAttempt) > reengageAfter) {
             lastReengageAttempt = now;
             if (!Engage()) {
+                // overlay_ survives a failed Engage, so its presence says how far
+                // the attempt got.
+                engageCostly_ = overlay_ != nullptr;
+                if (engageCostly_) ++costlyFails_;
                 // Once, then every 30 s. Waiting for Chrome is the normal state
                 // of a background tool, and a line a second would bury the log
                 // that matters when it finally attaches.
@@ -1934,6 +2260,13 @@ int App::Run() {
                         static_cast<unsigned long long>(reengageFails_));
             } else {
                 reengageFails_ = 0;
+                // NOT costlyFails_: an engagement that succeeds and then dies
+                // half a second later is the case the backoff exists for, and
+                // clearing the count here is what let it rebuild the whole
+                // pipeline once a second for ever (review, 2026-09-20). It is
+                // cleared below, once the engagement has held.
+                engageCostly_ = false;
+                engagedAtQpc_ = now;
             }
         }
 
@@ -2037,7 +2370,50 @@ int RunUiSnapshot(const AppOptions& opt, const Settings& settings) {
     return rc;
 }
 
+// The program is linked /SUBSYSTEM:WINDOWS so that autostart never flashes a
+// console (P7). That costs the lab nothing: a GUI-subsystem process inherits
+// its standard handles exactly like a console one, so `silkplay.exe > run.log`
+// and every harness that passes a pipe to subprocess.Popen keep working
+// unchanged. Only an interactive run from a terminal has nowhere to write, and
+// that is what this restores - on demand, never by default.
+bool g_allocatedConsole = false;
+
+void EnsureConsole() {
+    const HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    // Already redirected or inherited: that handle is the developer's choice and
+    // must not be clobbered.
+    if (h && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN) return;
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+        if (!AllocConsole()) return;
+        g_allocatedConsole = true;
+    }
+    FILE* f = nullptr;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    freopen_s(&f, "CONOUT$", "w", stderr);
+    // stdin too: without it the "[press Enter]" that holds an ALLOCATED console
+    // open reads EOF immediately, the window closes with the process, and the
+    // output it was allocated for is never seen (review, 2026-09-20).
+    freopen_s(&f, "CONIN$", "r", stdin);
+    SetConsoleOutputCP(CP_UTF8);
+}
+
+// Every switch below prints and is developer-only, so being asked for one is
+// being asked for output. --console is the explicit form.
+bool WantsConsole(int argc, char** argv) {
+    static const char* kSwitches[] = {
+        "--console", "--help", "-h", "/?", "--offline", "--offline-out", "--list-displays",
+        "--list-windows", "--dump", "--log-dirty", "--stats-every", "--warp-lab", "--field-lab",
+        "--ui-snapshot", "--default-settings", "--settings-file", "--game-gate-probe",
+    };
+    for (int i = 1; i < argc; ++i) {
+        for (const char* sw : kSwitches)
+            if (strcmp(argv[i], sw) == 0) return true;
+    }
+    return false;
+}
+
 int RunMain(int argc, char** argv) {
+    if (WantsConsole(argc, argv)) EnsureConsole();
     AppOptions opt;
     if (!ParseArgs(argc, argv, &opt)) return 1;
 
@@ -2172,6 +2548,54 @@ int RunMain(int argc, char** argv) {
         return rc;
     }
 
+    // THE GATE'S OWN ACCEPTANCE TEST. It opens no window, creates no overlay and
+    // captures nothing, so it can be left running beside the owner's real work
+    // for hours - which is the only way to prove the thing that matters most
+    // about a game gate: that it never pauses a video by mistake (N14).
+    if (opt.gateProbeSec > 0.0) {
+        GameGate gate;
+        std::string gerr;
+        if (!gate.Start(&gerr)) {
+            LogErr("game gate probe: %s", gerr.c_str());
+            CoUninitialize();
+            return 4;
+        }
+        Log("game gate probe: %.0f s, sampling. A line per verdict change, a summary at the end.",
+            opt.gateProbeSec);
+        const int64_t start = QpcNow();
+        GateVerdict last = GateVerdict::kClear;
+        int changes = 0;
+        double utilMax = 0.0;
+        uint64_t samplesSeen = 0;
+        GameGateStatus gs{};
+        while (QpcToSec(QpcNow() - start) < opt.gateProbeSec) {
+            Sleep(100);
+            gs = gate.Status();
+            samplesSeen = gs.samples;
+            utilMax = (std::max)(utilMax, gs.utilPct);
+            if (gs.verdict != last) {
+                last = gs.verdict;
+                ++changes;
+                Log("t=%7.1f s  verdict=%s  signal=%s  pid=%lu %s  util=%.0f%%",
+                    QpcToSec(QpcNow() - start),
+                    gs.verdict == GateVerdict::kPaused ? "PAUSED" : "clear",
+                    GameSignalName(gs.signal), gs.pid, Narrow(gs.exe).c_str(), gs.utilPct);
+            }
+            if (!gate.Ok()) {
+                LogErr("game gate probe: the gate gave up mid-run - see the lines above");
+                break;
+            }
+        }
+        Log("game gate probe done: %llu samples, %d verdict changes, peak tree load %.0f%%, "
+            "PDH collect p50 %.2f ms p99 %.2f ms",
+            static_cast<unsigned long long>(samplesSeen), changes, utilMax, gs.collectMsP50,
+            gs.collectMsP99);
+        Log("PASS means changes=0 while nothing but ordinary work ran.");
+        gate.Stop();
+        CoUninitialize();
+        return changes == 0 ? 0 : 1;
+    }
+
     if (opt.listWindows) {
         const auto all = EnumerateWindows();
         printf("%-18s %-8s %-24s %-28s %-22s %-6s %s\n", "HWND", "PID", "PROCESS", "CLASS",
@@ -2188,13 +2612,62 @@ int RunMain(int argc, char** argv) {
     // One engine per session. Two would each keep inserting their overlay into
     // the one slot above the browser, swapping places on every iteration (found
     // in review), and both would capture and generate the same video.
+    // ONE ENGINE PER SESSION. Two would take turns stealing the z-order slot
+    // above the browser and fight over the same hotkeys.
     HANDLE instance = CreateMutexW(nullptr, TRUE, L"Local\\NovaSilkPlay.Engine");
-    if (instance && GetLastError() == ERROR_ALREADY_EXISTS) {
+    bool alreadyRunning = instance && GetLastError() == ERROR_ALREADY_EXISTS;
+    if (!instance) {
+        // CreateMutexW can fail outright - most plausibly ACCESS_DENIED against a
+        // mutex another instance owns. Failing to CREATE it used to fall straight
+        // through into a second engine; ask whether it EXISTS instead (beta
+        // audit, 2026-09-20).
+        const DWORD createErr = GetLastError();
+        HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\NovaSilkPlay.Engine");
+        if (existing) {
+            CloseHandle(existing);
+            alreadyRunning = true;
+        } else {
+            LogErr("single-instance mutex could not be created (error %lu) and does not exist - "
+                   "continuing without the guard", createErr);
+        }
+    }
+    if (alreadyRunning) {
         LogErr("another silkplay.exe is already running in this session - exiting");
-        CloseHandle(instance);
+        // Started from a shortcut there is nowhere for that line to go, and the
+        // program appeared to do nothing at all. Say it on screen, but only then:
+        // a harness run must never stop on a dialog.
+        if (!GetConsoleWindow()) {
+            SetUiLanguage(settings.language);
+            MessageBoxW(nullptr,
+                        UiIsRussian()
+                            ? L"Nova SilkPlay \u0443\u0436\u0435 \u0437\u0430\u043f\u0443\u0449"
+                              L"\u0435\u043d\u0430.\n\n\u041e\u0442\u043a\u0440\u043e\u0439\u0442"
+                              L"\u0435 \u0435\u0451 \u0437\u043d\u0430\u0447\u043e\u043a \u0432 "
+                              L"\u043e\u0431\u043b\u0430\u0441\u0442\u0438 \u0443\u0432\u0435"
+                              L"\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u0439."
+                            : L"Nova SilkPlay is already running.\n\nUse its icon in the "
+                              L"notification area.",
+                        L"Nova SilkPlay", MB_OK | MB_ICONINFORMATION);
+        }
+        if (instance) CloseHandle(instance);
         CoUninitialize();
         return 3;
     }
+
+    // A SECOND, PLAIN mutex, for Inno Setup's AppMutex: an unprefixed name lands
+    // in the session namespace, which is what the installer opens to notice that
+    // the program is running. A Global\\ name is impossible here - an unelevated
+    // process has no SeCreateGlobalPrivilege. This one is never waited on; its
+    // existence is the whole signal.
+    HANDLE appMutex = CreateMutexW(nullptr, FALSE, L"NovaSilkPlayAppMutex");
+
+    // Keep the Run value pointing at THIS executable after a reinstall into a
+    // different folder. It never creates one that is not already there.
+    AutostartRepair();
+
+    // Manual-reset and created here, not opened: we own it, and a stale set
+    // state from a previous run cannot exist because the object dies with us.
+    g_quitEvent = CreateEventW(nullptr, TRUE, FALSE, kQuitEventName);
 
     g_runDone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     SetConsoleCtrlHandler(&OnConsoleCtrl, TRUE);
@@ -2202,6 +2675,19 @@ int RunMain(int argc, char** argv) {
     const int rc = app.Run();
     if (g_runDone) SetEvent(g_runDone);
     if (instance) CloseHandle(instance);
+    if (appMutex) CloseHandle(appMutex);
+    if (g_quitEvent) {
+        CloseHandle(g_quitEvent);
+        g_quitEvent = nullptr;
+    }
+    // A console WE allocated vanishes with the process, taking the output with
+    // it. One that we attached to, or that was redirected, belongs to someone
+    // else and is left alone.
+    if (g_allocatedConsole) {
+        fputs("\n[press Enter]", stdout);
+        fflush(stdout);
+        (void)getchar();
+    }
     CoUninitialize();
     return rc;
 }
@@ -2209,4 +2695,13 @@ int RunMain(int argc, char** argv) {
 }  // namespace
 }  // namespace nsp
 
-int main(int argc, char** argv) { return nsp::RunMain(argc, argv); }
+// /SUBSYSTEM:WINDOWS, so autostart never flashes a console (P7).
+//
+// WinMain, NOT wWinMain, and the difference is not cosmetic: the entry point
+// chooses which CRT startup runs, and wWinMainCRTStartup builds only __wargv -
+// __argv stays NULL and the first argv[i] crashes the process. MEASURED here
+// (2026-09-20): the wWinMain build segfaulted on `silkplay.exe --help` before
+// printing a byte. WinMainCRTStartup fills __argc/__argv exactly as
+// mainCRTStartup did, so ParseArgs, the wide-argument helper and the ACP
+// encoding of argv are all byte-identical to what main() used to see.
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) { return nsp::RunMain(__argc, __argv); }

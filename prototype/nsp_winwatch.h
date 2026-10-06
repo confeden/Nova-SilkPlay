@@ -33,6 +33,12 @@ public:
     // calls TakeDirty (the message pump), so no locking is needed.
     bool TakeDirty();
 
+    // True if EVENT_SYSTEM_FOREGROUND arrived since the last call; clears the flag.
+    // Separate from TakeDirty() so the occlusion test and the game gate can each
+    // consume the event once — one flag shared between two consumers would mean
+    // whichever polled first swallowed the other's notification.
+    bool TakeForegroundChanged();
+
     // True between EVENT_SYSTEM_MOVESIZESTART and EVENT_SYSTEM_MOVESIZEEND. A
     // window being dragged moves without raising any event we hook, so the caller
     // re-runs the test on every iteration while this is true.

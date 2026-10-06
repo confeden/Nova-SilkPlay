@@ -20,13 +20,36 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-set "SOURCES=main.cpp nsp_common.cpp nsp_overlay.cpp nsp_capture.cpp nsp_synth.cpp nsp_dump.cpp nsp_ofa.cpp nsp_image.cpp nsp_offline.cpp nsp_tray.cpp nsp_winwatch.cpp nsp_settings.cpp nsp_settings_window.cpp nsp_ui_text.cpp"
+set "SOURCES=main.cpp nsp_common.cpp nsp_overlay.cpp nsp_capture.cpp nsp_synth.cpp nsp_dump.cpp nsp_ofa.cpp nsp_image.cpp nsp_offline.cpp nsp_tray.cpp nsp_winwatch.cpp nsp_settings.cpp nsp_settings_window.cpp nsp_ui_text.cpp nsp_gamegate.cpp nsp_autostart.cpp nsp_drm.cpp"
 
 for %%F in (%SOURCES% silkplay.rc silkplay.manifest res\silk.ico res\silk_off.ico) do (
     if not exist "%%F" (
         echo FAILED: missing source file %%F
         exit /b 1
     )
+)
+
+rem VERSION GUARD. nsp_version.h is the single source: the .rc #includes it, the exe's
+rem VERSIONINFO comes from that, and installer\silkplay.iss reads the version back OUT of the
+rem built exe. silkplay.manifest is the one string the preprocessor cannot reach - rc.exe embeds
+rem the file verbatim - so its assemblyIdentity version is checked here instead. A drift would
+rem otherwise ship an installer whose name disagrees with the binary's side-by-side identity.
+set "MAJ=" & set "MIN=" & set "PAT=" & set "BLD="
+for /f "tokens=3" %%V in ('findstr /c:"#define NSP_VERSION_MAJOR" nsp_version.h') do set "MAJ=%%V"
+for /f "tokens=3" %%V in ('findstr /c:"#define NSP_VERSION_MINOR" nsp_version.h') do set "MIN=%%V"
+for /f "tokens=3" %%V in ('findstr /c:"#define NSP_VERSION_PATCH" nsp_version.h') do set "PAT=%%V"
+for /f "tokens=3" %%V in ('findstr /c:"#define NSP_VERSION_BUILD" nsp_version.h') do set "BLD=%%V"
+if "%MAJ%%MIN%%PAT%%BLD%" == "" (
+    echo FAILED: could not read NSP_VERSION_* out of nsp_version.h.
+    exit /b 1
+)
+set "QUAD=%MAJ%.%MIN%.%PAT%.%BLD%"
+rem The \" is findstr's own escape for a literal quote inside /c:, so this matches the exact
+rem attribute and not a substring of some other version in the file.
+findstr /c:"version=\"%QUAD%\"" silkplay.manifest >nul
+if %errorlevel% neq 0 (
+    echo FAILED: silkplay.manifest does not carry version="%QUAD%" from nsp_version.h.
+    exit /b 1
 )
 
 if not exist ".\obj\" mkdir ".\obj\"
@@ -50,7 +73,7 @@ cl.exe /nologo /EHsc /std:c++20 /W4 /bigobj /O2 /utf-8 /I.\obj ^
     /Fo.\obj\ ^
     %SOURCES% .\obj\silkplay.res ^
     /Fe:".\silkplay.exe" ^
-    /link d3d11.lib dxgi.lib dcomp.lib dwmapi.lib user32.lib dxguid.lib d3dcompiler.lib windowscodecs.lib bcrypt.lib windowsapp.lib shell32.lib comctl32.lib gdiplus.lib shcore.lib ole32.lib gdi32.lib
+    /link /SUBSYSTEM:WINDOWS d3d11.lib dxgi.lib dcomp.lib dwmapi.lib user32.lib dxguid.lib d3dcompiler.lib windowscodecs.lib bcrypt.lib windowsapp.lib shell32.lib comctl32.lib gdiplus.lib shcore.lib ole32.lib gdi32.lib pdh.lib advapi32.lib
 if %errorlevel% neq 0 (
     echo FAILED: Compilation or link failed.
     exit /b 1

@@ -6,10 +6,13 @@
 
 #include <dwmapi.h>
 #include <psapi.h>
+#include <shlobj.h>  // SHGetKnownFolderPath, for the log directory under %LOCALAPPDATA%
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 
 namespace nsp {
 namespace {
@@ -28,37 +31,109 @@ int64_t StartQpc() {
     return t0;
 }
 
+// ------------------------------------------------------- the log file tee
+//
+// The shipped binary is /SUBSYSTEM:WINDOWS and is normally started from the
+// HKCU Run key, with no console and nothing redirected: stdout goes nowhere.
+// Without this tee a beta bug report is an empty hand.
+
+std::atomic<bool> g_fileLog{true};
+
+// A measurement run writes no file. main.cpp owns the parsed options but is off
+// limits for this change (P7), so the three switches that mark such a run are
+// read straight off the command line instead of from Opt. --offline and its
+// --offline-out variant both match the same prefix, which is correct: both are
+// offline harness runs that already write their own output, and
+// --default-settings / --ui-snapshot are the golden-image paths whose whole
+// point is that the run perturbs nothing in the user's profile.
+bool MeasurementRun() {
+    const wchar_t* cmd = GetCommandLineW();
+    if (!cmd) return false;
+    return wcsstr(cmd, L"--offline") != nullptr || wcsstr(cmd, L"--default-settings") != nullptr ||
+           wcsstr(cmd, L"--ui-snapshot") != nullptr;
+}
+
+// Keep the newest `keep` logs and delete the rest. The name carries a
+// zero-padded timestamp, so lexicographic order IS chronological and no file
+// times have to be read. A beta must not grow without bound in a user's profile.
+void PruneLogs(const std::wstring& dir, size_t keep) {
+    std::vector<std::wstring> names;
+    WIN32_FIND_DATAW fd{};
+    const HANDLE h = FindFirstFileW((dir + L"\\silkplay-*.log").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;  // none yet: nothing to prune, not an error
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) names.emplace_back(fd.cFileName);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (names.size() <= keep) return;
+    std::sort(names.begin(), names.end());
+    for (size_t i = 0; i + keep < names.size(); ++i) DeleteFileW((dir + L"\\" + names[i]).c_str());
+}
+
+// Opened once, on the first line anyone logs. Returns null when there is no
+// file to write to, which is a normal state (measurement run, unwritable
+// profile) and never an error worth a message - we would have nowhere to put it.
+FILE* LogFile() {
+    static FILE* f = []() -> FILE* {
+        if (MeasurementRun()) return nullptr;
+        wchar_t* base = nullptr;
+        if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base))) return nullptr;
+        std::wstring dir = base;
+        CoTaskMemFree(base);
+        // settings.json already lives in the first of these; the logs go beside it.
+        dir += L"\\Nova SilkPlay";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        dir += L"\\logs";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        PruneLogs(dir, 9);  // 9 survivors + the one opened below = the newest 10
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        wchar_t name[64];
+        _snwprintf_s(name, _TRUNCATE, L"\\silkplay-%04u%02u%02u-%02u%02u%02u.log",
+                     static_cast<unsigned>(st.wYear), static_cast<unsigned>(st.wMonth),
+                     static_cast<unsigned>(st.wDay), static_cast<unsigned>(st.wHour),
+                     static_cast<unsigned>(st.wMinute), static_cast<unsigned>(st.wSecond));
+        FILE* h = nullptr;
+        // Text mode, NOT "ccs=UTF-8": a ccs= stream is Unicode-oriented and the
+        // narrow fprintf below would be the wrong half of the CRT for it. The
+        // lines are already UTF-8 bytes (Narrow() encodes with CP_UTF8), so the
+        // file only needs the BOM written in front of them to be read as UTF-8.
+        if (_wfopen_s(&h, (dir + name).c_str(), L"w") != 0 || !h) return nullptr;
+        fputs("\xEF\xBB\xBF", h);
+        return h;
+    }();
+    return f;
+}
+
 void VLogTo(FILE* f, const char* fmt, va_list ap) {
     const double ms = QpcToMs(QpcNow() - StartQpc());
     char buf[2048];
     const int n = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
     if (n < 0) buf[sizeof(buf) - 1] = '\0';
-    fprintf(f, "[%10.3f] %s", ms, buf);
     const size_t len = strlen(buf);
+    fprintf(f, "[%10.3f] %s", ms, buf);
     if (len == 0 || buf[len - 1] != '\n') fputc('\n', f);
     fflush(f);
-}
 
-std::wstring ProcessImageName(DWORD pid) {
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h) return L"";
-    wchar_t path[MAX_PATH] = {};
-    DWORD n = ARRAYSIZE(path);
-    std::wstring out;
-    if (QueryFullProcessImageNameW(h, 0, path, &n)) {
-        out.assign(path, n);
-        const size_t slash = out.find_last_of(L'\\');
-        if (slash != std::wstring::npos) out = out.substr(slash + 1);
+    if (!g_fileLog.load(std::memory_order_relaxed)) return;
+    if (FILE* lf = LogFile()) {
+        fprintf(lf, "[%10.3f] %s", ms, buf);
+        if (len == 0 || buf[len - 1] != '\n') fputc('\n', lf);
+        // Flushed per line like stdout, and for the same reason: a crash must not
+        // swallow the last lines, which are exactly the ones a report needs.
+        fflush(lf);
     }
-    CloseHandle(h);
-    return out;
 }
 
-bool IsCloaked(HWND hwnd) {
-    DWORD cloaked = 0;
-    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))))
-        return cloaked != 0;
-    return false;
+// The basename of ProcessImagePath — one OpenProcess code path for both, so the
+// game gate's full-path lookup and this file's short name cannot drift apart.
+// Lower-case, like the path: every comparison against it in the tree is already
+// case-insensitive (_wcsicmp, ContainsNoCase) or lower-cases first.
+std::wstring ProcessImageName(DWORD pid) {
+    std::wstring out = ProcessImagePath(pid);
+    const size_t slash = out.find_last_of(L'\\');
+    if (slash != std::wstring::npos) out = out.substr(slash + 1);
+    return out;
 }
 
 struct EnumCtx {
@@ -112,6 +187,8 @@ void LogErr(const char* fmt, ...) {
     VLogTo(stderr, fmt, ap);
     va_end(ap);
 }
+
+void SetFileLogging(bool on) { g_fileLog.store(on, std::memory_order_relaxed); }
 
 std::string HrString(HRESULT hr) {
     char buf[128];
@@ -260,6 +337,32 @@ double DesktopMaxRefreshHz() {
         },
         reinterpret_cast<LPARAM>(&best));
     return best > 1.0 ? best : 60.0;
+}
+
+// ----------------------------------------------------------------- processes
+
+std::wstring ProcessImagePath(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return L"";
+    wchar_t path[MAX_PATH] = {};
+    DWORD n = ARRAYSIZE(path);
+    std::wstring out;
+    if (QueryFullProcessImageNameW(h, 0, path, &n)) out.assign(path, n);
+    CloseHandle(h);
+    return out;
+}
+
+std::wstring ProcessImageNameLower(DWORD pid) {
+    std::wstring out = ProcessImagePath(pid);
+    std::transform(out.begin(), out.end(), out.begin(), ::towlower);
+    return out;
+}
+
+bool IsCloaked(HWND hwnd) {
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))))
+        return cloaked != 0;
+    return false;
 }
 
 // ------------------------------------------------------------- target window

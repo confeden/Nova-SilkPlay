@@ -29,6 +29,11 @@ constexpr Entry kText[] = {
     {L"PotPlayer", L"PotPlayer"},
     {L"Coming after the beta", L"Появится после бета-версии"},
     {L"General", L"Общие"},
+    {L"Start with Windows", L"Запускать вместе с Windows"},
+    {L"Nova SilkPlay appears in the notification area at sign-in",
+     L"Nova SilkPlay появляется в области уведомлений при входе"},
+    {L"Turned off in Task Manager → Startup apps",
+     L"Отключено в Диспетчере задач → Автозагрузка"},
     {L"Frame rate counter", L"Счётчик кадров"},
     {L"Source and output frame rate in the corner of the video",
      L"Исходная и итоговая частота в углу видео"},
@@ -42,10 +47,15 @@ constexpr Entry kText[] = {
     {L"no browser selected in Settings", L"в настройках не выбран браузер"},
     {L"waiting for fullscreen video in %ls", L"жду видео во весь экран в %ls"},
     {L"paused: a window covers the video", L"пауза: видео закрыто окном"},
+    {L"paused: a game is running (%ls)", L"пауза: запущена игра (%ls)"},
     {L"%ls: no video playing", L"%ls: видео не воспроизводится"},
     {L"%d → %d fps in %ls", L"%d → %d кадров/с в %ls"},
     {L"settings could not be read — choose a browser in Settings",
      L"настройки не прочитаны — выберите браузер в Настройках"},
+    {L"Nova SilkPlay", L"Nova SilkPlay"},
+    {L"The change could not be saved and applies to this session only.",
+     L"Изменение не сохранено и действует только до выхода."},
+    {L"protected video is not touched", L"защищённое видео не трогаем"},
 };
 
 std::atomic<bool> g_russian{false};

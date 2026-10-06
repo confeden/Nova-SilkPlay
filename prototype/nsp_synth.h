@@ -151,13 +151,16 @@ public:
     bool DebugFieldStats(float* p50, float* p95, float* maxAbs, float* zeroFrac);
 
     // The frame-rate readout, the way Lossless Scaling shows its own: plain text
-    // "<source fps>/<output fps>", white with a one-pixel dark outline so it
+    // "<source fps> → <output fps>", white with a one-pixel dark outline so it
     // reads over any picture, at a FIXED place — the top-right corner of the video
     // rect (owner, 2026-09-13). No chip, no hover, nothing that moves.
-    // Draws `text` with its top-right corner at (right, top) in render-target
-    // pixels; characters outside 0-9 and '/' are skipped.
-    bool DrawFpsText(ID3D11RenderTargetView* rtv, UINT w, UINT h, float right, float top, int scale,
-                     const std::string& text);
+    //
+    // Real text in a real font: Windows rasterises `text` once, whenever the
+    // string changes, and the per-tick cost is one small textured quad. Draws it
+    // with its top-right corner at (right, top) in render-target pixels;
+    // `fontPx` is the font height in pixels and is clamped to what fits.
+    bool DrawFpsText(ID3D11RenderTargetView* rtv, UINT w, UINT h, float right, float top,
+                     int fontPx, const std::wstring& text);
 
 private:
     struct Impl;

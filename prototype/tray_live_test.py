@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import winreg
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = os.path.join(HERE, "silkplay.exe")
@@ -32,6 +33,22 @@ SETTINGS = os.path.join(TMP, "settings.json")
 RU_TITLE = "Nova SilkPlay — Настройки"
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+# ctypes defaults every return to C int, which truncates a 64-bit HANDLE.
+kernel32.OpenEventW.restype = wt.HANDLE
+kernel32.OpenEventW.argtypes = [wt.DWORD, wt.BOOL, wt.LPCWSTR]
+kernel32.SetEvent.argtypes = [wt.HANDLE]
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
+EVENT_MODIFY_STATE = 0x0002
+
+
+def read_run_value():
+    """The HKCU Run value the autostart switch writes, or None."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return winreg.QueryValueEx(k, RUN_VALUE)[0]
+    except OSError:
+        return None
 user32.FindWindowW.restype = wt.HWND
 user32.GetDlgItem.restype = wt.HWND
 user32.SendMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
@@ -47,7 +64,10 @@ CB_SETCURSEL = 0x014E
 IDCANCEL = 2
 # nsp_tray.cpp menu ids and nsp_settings_window.cpp control ids
 CMD_SETTINGS, CMD_TOGGLE, CMD_QUIT = 100, 101, 103
-ID_CHROME, ID_POTPLAYER, ID_COUNTER, ID_LANGUAGE = 1000, 1001, 1002, 1003
+# The ids are kCtlBase + the Row enum, so inserting a row shifts everything after it.
+ID_CHROME, ID_POTPLAYER, ID_AUTOSTART, ID_COUNTER, ID_LANGUAGE = 1000, 1001, 1002, 1003, 1004
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE = "Nova SilkPlay"
 
 results = []
 
@@ -129,9 +149,11 @@ def run_a():
             check("second click reuses the window", len(settings_windows()) == 1,
                   f"{len(settings_windows())} windows")
 
-            ctls = [user32.GetDlgItem(sw, i) for i in (ID_CHROME, ID_POTPLAYER, ID_COUNTER, ID_LANGUAGE)]
+            ctls = [user32.GetDlgItem(sw, i)
+                    for i in (ID_CHROME, ID_POTPLAYER, ID_AUTOSTART, ID_COUNTER, ID_LANGUAGE)]
             check("controls exist", all(ctls))
             check("PotPlayer switch is disabled", not user32.IsWindowEnabled(ctls[1]))
+            check("autostart switch is enabled", bool(user32.IsWindowEnabled(ctls[2])))
 
             click(sw, ID_CHROME)
             time.sleep(0.6)
@@ -148,8 +170,24 @@ def run_a():
             time.sleep(0.6)
             check("counter off saved", read_json().get("general", {}).get("fpsCounter") is False, str(read_json()))
 
-            user32.SendMessageW(ctls[3], CB_SETCURSEL, 2, 0)
-            user32.SendMessageW(sw, WM_COMMAND, (CBN_SELCHANGE << 16) | ID_LANGUAGE, ctls[3])
+            # AUTOSTART lives in the registry, never in settings.json - that is the whole
+            # point of the design, and a copy in the JSON would be a second source of truth.
+            # The test leaves the machine as it found it: whatever the value was before, it is
+            # restored at the end of this block.
+            had_autostart = read_run_value() is not None
+            click(sw, ID_AUTOSTART)
+            time.sleep(0.6)
+            check("autostart toggled in the registry", (read_run_value() is not None) != had_autostart,
+                  repr(read_run_value()))
+            check("autostart is NOT in settings.json",
+                  "autostart" not in json.dumps(read_json()).lower(), str(read_json()))
+            click(sw, ID_AUTOSTART)
+            time.sleep(0.6)
+            check("autostart toggled back", (read_run_value() is not None) == had_autostart,
+                  repr(read_run_value()))
+
+            user32.SendMessageW(ctls[4], CB_SETCURSEL, 2, 0)
+            user32.SendMessageW(sw, WM_COMMAND, (CBN_SELCHANGE << 16) | ID_LANGUAGE, ctls[4])
             time.sleep(0.6)
             check("language ru saved", read_json().get("general", {}).get("language") == "ru", str(read_json()))
             check("window relabelled in Russian", title(sw) == RU_TITLE, title(sw))
@@ -199,24 +237,30 @@ def run_b():
         try:
             wait_for(lambda: user32.FindWindowW("NovaSilkPlayTray", None), 10)
             time.sleep(1.5)
-            try:
-                os.kill(p.pid, signal.CTRL_BREAK_EVENT)
+            # silkplay.exe is linked /SUBSYSTEM:WINDOWS, so it has no console and
+            # GenerateConsoleCtrlEvent can no longer reach it. It opens a named
+            # manual-reset event instead and leaves its loop by the same path.
+            h = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, "Local\\NovaSilkPlay.Quit")
+            if h:
+                kernel32.SetEvent(h)
+                kernel32.CloseHandle(h)
                 sent = True
-            except OSError as e:
-                print(f"SKIP Ctrl+Break: could not send ({e})")
+            else:
+                print("SKIP quit event: the engine did not create it")
             if sent:
                 try:
                     rc = p.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     rc = None
-                check("Ctrl+Break exits with 0", rc == 0, f"rc={rc}")
-                check("tray window gone after Ctrl+Break", not user32.FindWindowW("NovaSilkPlayTray", None))
+                check("quit event exits with 0", rc == 0, f"rc={rc}")
+                check("tray window gone after the quit event",
+                      not user32.FindWindowW("NovaSilkPlayTray", None))
         finally:
             if p.poll() is None:
                 p.kill()
     text = open(log_path, encoding="utf-8", errors="replace").read()
     if sent:
-        check("log: console quit line", "console closed or Ctrl+C - quitting" in text)
+        check("log: quit event line", "quit requested through" in text)
     check("no browser selected: nothing captured", "no browser is selected in Settings - nothing to capture" in text)
     check("no browser selected: nothing engaged", "target: hwnd=" not in text and "engaged, mode=" not in text)
 

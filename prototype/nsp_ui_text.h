@@ -22,6 +22,9 @@ enum class Txt {
     kPotPlayerTitle,
     kPotPlayerNote,
     kSectionGeneral,
+    kAutostartTitle,
+    kAutostartNote,
+    kAutostartBlocked,  // the note when Task Manager has the entry disabled
     kCounterTitle,
     kCounterNote,
     kLanguageTitle,
@@ -33,9 +36,13 @@ enum class Txt {
     kStatusNothingSelected,
     kStatusWaiting,     // %ls application
     kStatusCovered,
+    kStatusGamePaused,  // %ls the game's image name
     kStatusNoVideo,     // %ls application
     kStatusGenerating,  // %d source fps, %d output fps, %ls application
     kStatusSettingsUnreadable,
+    kSaveFailedTitle,
+    kSaveFailedBody,    // the change holds for this run only
+    kStatusProtected,   // protected video, or a browser we cannot inspect
     kCount
 };
 

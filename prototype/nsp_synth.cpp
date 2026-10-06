@@ -22,6 +22,8 @@
 #include <cmath>
 #include <cstring>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -50,6 +52,8 @@ Texture2D<float2>   mvBTex : register(t8);
 // P23: 1x1, this pair's decision from CSCutDecide: r = unreliable (cross-fade instead
 // of warping), g = hard cut (hold A until B is due).
 Texture2D<float2>   cutTex : register(t9);
+// The frame-rate readout, rasterised on the CPU by GDI when the string changes.
+Texture2D<float4>   badgeTex : register(t10);
 SamplerState        smpPt  : register(s0);
 SamplerState        smpLin : register(s1);
 
@@ -389,44 +393,33 @@ float4 PSWarpLab(VSOut i) : SV_Target {
 }
 
 // ------------------------------------------------------------- fps readout
-// Plain 5x7 pixel-font text. The font table and the string arrive in the
-// constant buffer, so the glyphs stay readable ASCII art in C++ instead of magic
-// numbers in HLSL.
+// Real text, not drawn glyphs. Windows rasterises the string with a real font
+// (GDI, greyscale-antialiased) whenever it CHANGES — twice a second at most,
+// because main.cpp settles the numbers — into the small texture below. Per
+// output tick this shader only reads that texture back, so a proper typeface
+// costs the hot path nothing.
+//   .r = glyph coverage, .g = a soft dark halo around it (the coverage dilated
+// by two pixels and blurred), which keeps white text readable over a bright sky
+// without putting a banner behind it. MEASURED: the render target view is
+// _SRGB, so this composites in LINEAR light, where a thin hard outline comes out
+// far weaker than the font rasteriser intended.
 cbuffer TextParams : register(b3) {
-    float4 gTRect;      // x, y of the text's top-left corner; w, h of the text box
-    float4 gTInk;       // text colour, linear light, .a = opacity
-    float4 gTMisc;      // y glyph scale, z glyph count
+    float4 gTRect;      // x, y of the text's top-left corner; z, w its size in pixels
+    float4 gTInk;       // text colour, linear light
+    float4 gTMisc;      // y halo opacity
     float4 gTPad;
-    uint4  gTGlyphs[4]; // up to 16 glyph indices into the font table
-    uint4  gTFont[4];   // up to 16 glyphs, 5x7 bits each
 };
 
-float GlyphInk(float2 p) {
-    float scale = max(gTMisc.y, 1.0);
-    float count = gTMisc.z;
-    float2 lp = (p - gTRect.xy) / scale;
-    if (lp.x < 0.0 || lp.y < 0.0 || lp.y >= 7.0) return 0.0;
-    int gi = (int)floor(lp.x / 6.0);
-    if (gi < 0 || gi >= (int)count) return 0.0;
-    int cx = (int)floor(lp.x - gi * 6.0);
-    int cy = (int)floor(lp.y);
-    if (cx < 0 || cx > 4) return 0.0;
-    uint g = gTGlyphs[gi >> 2][gi & 3];
-    uint bits = gTFont[g >> 2][g & 3];
-    return ((bits >> (uint)(cy * 5 + (4 - cx))) & 1u) ? 1.0 : 0.0;
-}
-
 float4 PSFpsText(VSOut i) : SV_Target {
-    float2 p = i.pos.xy;
-    if (GlyphInk(p) > 0.0) return float4(gTInk.rgb, gTInk.a);
-    // One pixel of dark outline around the glyphs: white text alone vanishes over
-    // a bright sky, and a box behind it would be a banner again.
-    float o = 0.0;
-    for (int dy = -1; dy <= 1; ++dy)
-        for (int dx = -1; dx <= 1; ++dx)
-            o = max(o, GlyphInk(p + float2(dx, dy)));
-    if (o <= 0.0) discard;
-    return float4(0.0, 0.0, 0.0, 0.75);
+    int2 p = int2(i.pos.xy) - int2((int)gTRect.x, (int)gTRect.y);
+    if (p.x < 0 || p.y < 0 || p.x >= (int)gTRect.z || p.y >= (int)gTRect.w) discard;
+    float4 c = badgeTex.Load(int3(p, 0));
+    float a = max(c.r, c.g * gTMisc.y);
+    if (a <= 0.0) discard;
+    // Premultiplied (blended ONE / INV_SRC_ALPHA): the ink is already weighted by
+    // the glyph's own coverage, so a half-covered pixel over the halo stays half
+    // dark instead of brightening it.
+    return float4(gTInk.rgb * c.r, a);
 }
 
 // ------------------------------------------------------------ luma pyramid
@@ -974,39 +967,13 @@ struct DsCb {
     UINT pad2[2];
 };
 
-// The 5x7 pixel font, as ASCII art so it stays editable. Row 0 is the top; a
-// '#' is ink. Packed into one uint per glyph, bit (row*5 + (4-col)).
-struct Glyph {
-    char ch;
-    const char* rows[7];
-};
-
-constexpr Glyph kGlyphs[] = {
-    {'0', {"#####", "#   #", "#   #", "#   #", "#   #", "#   #", "#####"}},
-    // The other digits are drawn with full-width bars, so a thin 1 next to them
-    // reads as an I (or, without a base, as a stray tick). A two-pixel stem
-    // gives it the same visual weight as its neighbours.
-    {'1', {"  ## ", " ### ", "  ## ", "  ## ", "  ## ", "  ## ", " ####"}},
-    {'2', {"#####", "    #", "    #", "#####", "#    ", "#    ", "#####"}},
-    {'3', {"#####", "    #", "    #", "#####", "    #", "    #", "#####"}},
-    {'4', {"#   #", "#   #", "#   #", "#####", "    #", "    #", "    #"}},
-    {'5', {"#####", "#    ", "#    ", "#####", "    #", "    #", "#####"}},
-    {'6', {"#####", "#    ", "#    ", "#####", "#   #", "#   #", "#####"}},
-    {'7', {"#####", "    #", "    #", "   # ", "  #  ", "  #  ", "  #  "}},
-    {'8', {"#####", "#   #", "#   #", "#####", "#   #", "#   #", "#####"}},
-    {'9', {"#####", "#   #", "#   #", "#####", "    #", "    #", "#####"}},
-    {'/', {"    #", "    #", "   # ", "  #  ", " #   ", "#    ", "#    "}},
-};
-constexpr int kGlyphCount = static_cast<int>(std::size(kGlyphs));
-static_assert(kGlyphCount <= 16, "the text constant buffer holds 16 glyphs");
-
+// The frame-rate readout's constant buffer. The glyphs themselves no longer
+// live here: GDI rasterises them into Impl::badgeTex when the string changes.
 struct TextCb {
-    float rect[4];
-    float ink[4];
-    float misc[4];
+    float rect[4];   // x, y, width, height of the rasterised text, render-target pixels
+    float ink[4];    // text colour, linear light
+    float misc[4];   // [1] halo opacity
     float pad[4];
-    UINT glyphs[16];
-    UINT font[16];
 };
 
 
@@ -1038,7 +1005,32 @@ struct McCb {
 };
 static_assert(offsetof(McCb, hintW) == 64, "McCb must match the HLSL McParams packing (G54)");
 
+// COMPILED ONCE PER PROCESS, NOT PER ENGAGE. The HLSL source is a fixed string
+// in this binary, so the bytecode a given entry point compiles to can never
+// differ between calls - only the ID3D11*Shader built FROM it is tied to a
+// device. Re-engaging used to recompile all nineteen shaders on the engine
+// thread: MEASURED at roughly 400 ms of dead time, and a display change or a
+// window move triggers a re-engage, so a user dragging the browser between
+// monitors paid it every time (beta audit, 2026-09-20). Holding the blobs costs
+// a few hundred kilobytes for the life of the run.
+//
+// The mutex is not for contention - Create runs on the engine thread - but so
+// that a future second Synth cannot race this map into an inconsistent state.
+std::mutex g_blobCacheMutex;
+std::map<std::string, ComPtr<ID3DBlob>> g_blobCache;
+
 bool CompileOne(const char* entry, const char* target, ID3DBlob** blob, std::string* err) {
+    const std::string key = std::string(entry) + "|" + target;
+    {
+        std::lock_guard<std::mutex> lock(g_blobCacheMutex);
+        auto it = g_blobCache.find(key);
+        if (it != g_blobCache.end()) {
+            *blob = it->second.Get();
+            (*blob)->AddRef();
+            return true;
+        }
+    }
+
     ComPtr<ID3DBlob> errors;
     const UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
     const HRESULT hr = D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "nsp_synth.hlsl",
@@ -1052,10 +1044,34 @@ bool CompileOne(const char* entry, const char* target, ID3DBlob** blob, std::str
         if (err) *err = msg;
         return false;
     }
+    {
+        std::lock_guard<std::mutex> lock(g_blobCacheMutex);
+        g_blobCache[key] = *blob;
+    }
     return true;
 }
 
 UINT DivUp(UINT a, UINT b) { return (a + b - 1) / b; }
+
+// The lab switches below are read from the environment once each. getenv is
+// deprecated under /W4 and a beta should build clean, so this is the supported
+// spelling; the value is copied out and the buffer freed immediately.
+bool EnvSet(const char* name) {
+    char* v = nullptr;
+    size_t n = 0;
+    if (_dupenv_s(&v, &n, name) != 0 || !v) return false;
+    free(v);
+    return true;
+}
+
+std::string EnvValue(const char* name) {
+    char* v = nullptr;
+    size_t n = 0;
+    if (_dupenv_s(&v, &n, name) != 0 || !v) return std::string();
+    std::string out(v);
+    free(v);
+    return out;
+}
 
 // R16G16_FLOAT readback: the motion field is stored as halves.
 float HalfToFloat(uint16_t h) {
@@ -1174,7 +1190,33 @@ struct Synth::Impl {
     ComPtr<ID3D11RasterizerState> raster;
     ComPtr<ID3D11RasterizerState> rasterScissor;
     ComPtr<ID3D11DepthStencilState> depthOff;
-    UINT fontPacked[16] = {};
+    ComPtr<ID3D11BlendState> blendPremul;
+
+    // The frame-rate readout. The string is rasterised by GDI into badgeTex when
+    // it changes - twice a second at most - and only read back after that, so
+    // the hot path never touches a font. The texture is allocated once at the
+    // largest size the readout can need, because reallocating a GPU resource
+    // while video is playing is exactly the kind of hitch D22 forbids.
+    static constexpr UINT kBadgeTexW = 256;
+    static constexpr UINT kBadgeTexH = 64;
+    static constexpr int  kBadgeMaxFontPx = 24;
+    // Room around the glyphs for the halo. MEASURED: the overlay's render target
+    // view is _SRGB (nsp_overlay.cpp), so the hardware blends in LINEAR light,
+    // where a one-pixel dark outline at 0.75 all but disappears against a bright
+    // sky and the white fill then reads as a hollow ring. A radius-2 dilation
+    // blurred 5x5 is the widest halo that still looks like a shadow rather than a
+    // smudge at these sizes, and it was the only one of five variants legible on
+    // pale, mid-grey and dark backgrounds alike.
+    static constexpr int  kBadgePad = 4;
+    ComPtr<ID3D11Texture2D> badgeTex;
+    ComPtr<ID3D11ShaderResourceView> badgeSrv;
+    std::wstring badgeText;            // what badgeTex currently holds
+    int badgeFontPx = 0;
+    int badgeInkW = 0, badgeInkH = 0;  // the used corner of badgeTex, in pixels
+    bool badgeFailLogged = false;      // the rasteriser failure is reported once, not per tick
+    std::vector<uint8_t> badgePixels;  // scratch for the rasteriser, kept to avoid reallocating
+
+    bool RasterizeBadge(const std::wstring& text, int fontPx);
 
     UINT srcW = 0, srcH = 0;
     UINT gridW = 0, gridH = 0;
@@ -1248,7 +1290,6 @@ void Synth::Impl::ClearSrvs() {
 }
 
 void Synth::Impl::SetParams(float t, int occModeOverride) {
-    const UINT cellPx = this->cellPx;
     D3D11_MAPPED_SUBRESOURCE m{};
     if (SUCCEEDED(ctx->Map(cbParams.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         ParamsCb p{};
@@ -1651,7 +1692,7 @@ void Synth::Impl::RunCutDecide() {
 void Synth::Impl::UpdateCut(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b) {
     // DEBUG (env NSP_CUT_STATS): calibration readout - the raw residual's share above
     // several bands, then the share the warp actually receives. Blocking; offline only.
-    static const bool kCutStats = getenv("NSP_CUT_STATS") != nullptr;
+    static const bool kCutStats = EnvSet("NSP_CUT_STATS");
     if (kCutStats && cutTex) {
         RunCutStat(true);
         D3D11_TEXTURE2D_DESC td = {};
@@ -1863,17 +1904,29 @@ bool Synth::Create(ID3D11Device* device, ID3D11DeviceContext* ctx, std::string* 
         return false;
     }
 
-    // Pack the ASCII-art font once.
-    for (int g = 0; g < kGlyphCount; ++g) {
-        UINT bits = 0;
-        for (int row = 0; row < 7; ++row) {
-            const char* r = kGlyphs[g].rows[row];
-            for (int col = 0; col < 5; ++col) {
-                if (r[col] != ' ' && r[col] != '\0')
-                    bits |= 1u << static_cast<UINT>(row * 5 + (4 - col));
-            }
+    // The readout's texture. One fixed allocation, big enough for the longest
+    // string the readout can ever show ("999 -> 999" at the largest size we
+    // allow) plus the outline's margin, so a changing string never reallocates
+    // and never churns the GPU while video is playing. Only the used top-left
+    // corner is read back; the rest is left alone.
+    {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = Impl::kBadgeTexW;
+        td.Height = Impl::kBadgeTexH;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DYNAMIC;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        HRESULT hrb = device->CreateTexture2D(&td, nullptr, &d.badgeTex);
+        if (SUCCEEDED(hrb)) hrb = device->CreateShaderResourceView(d.badgeTex.Get(), nullptr,
+                                                                   &d.badgeSrv);
+        if (FAILED(hrb)) {
+            if (err) *err = "frame rate readout texture creation failed: " + HrString(hrb);
+            return false;
         }
-        d.fontPacked[g] = bits;
     }
 
     D3D11_BLEND_DESC bl = {};
@@ -1893,6 +1946,12 @@ bool Synth::Create(ID3D11Device* device, ID3D11DeviceContext* ctx, std::string* 
     ba.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     device->CreateBlendState(&ba, &d.blendAlpha);
 
+    // Premultiplied "over" for the readout: the glyph colour arrives already
+    // weighted by its own coverage, so a pixel that is half glyph and half
+    // outline stays half dark instead of being lightened twice.
+    ba.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    device->CreateBlendState(&ba, &d.blendPremul);
+
     D3D11_RASTERIZER_DESC rs = {};
     rs.FillMode = D3D11_FILL_SOLID;
     rs.CullMode = D3D11_CULL_NONE;
@@ -1906,35 +1965,189 @@ bool Synth::Create(ID3D11Device* device, ID3D11DeviceContext* ctx, std::string* 
     return true;
 }
 
-bool Synth::DrawFpsText(ID3D11RenderTargetView* rtv, UINT w, UINT h, float right, float top,
-                        int scale, const std::string& text) {
-    Impl& d = *impl_;
-    if (!d.ctx || !rtv || !d.psText || scale < 1) return false;
+// Rasterise the readout with a real font, once per string change. GDI, not
+// Direct2D: DirectWrite would want a D2D device context on the overlay's
+// swapchain surface, and interleaving D2D with our own D3D draws on the same
+// back buffer means a flush every tick and a second device to lose. This costs
+// one small DIB twice a second and nothing at all in between.
+//
+// ANTIALIASED_QUALITY, never ClearType: subpixel antialiasing paints coloured
+// fringes, and over arbitrary video those read as a colour artefact of ours.
+bool Synth::Impl::RasterizeBadge(const std::wstring& text, int fontPx) {
+    if (text.empty() || fontPx < 6) return false;
+    if (text == badgeText && fontPx == badgeFontPx && badgeInkW > 0) return true;
 
-    TextCb cb{};
-    int count = 0;
-    for (char ch : text) {
-        if (count >= 16) break;
-        for (int g = 0; g < kGlyphCount; ++g) {
-            if (kGlyphs[g].ch == ch) {
-                cb.glyphs[count++] = static_cast<UINT>(g);
-                break;
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) return false;
+
+    // Segoe UI is on every Windows 10/11. Semibold, because thin strokes at this
+    // size disappear into the video.
+    HFONT font = CreateFontW(-fontPx, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    if (!font) {
+        DeleteDC(dc);
+        return false;
+    }
+    HGDIOBJ oldFont = SelectObject(dc, font);
+
+    SIZE ext{};
+    const int pad = kBadgePad;  // room for the halo
+    int needW = 0, needH = 0;
+    bool measured = GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &ext) &&
+                    ext.cx > 0 && ext.cy > 0;
+    if (measured) {
+        needW = ext.cx + 2 * pad;
+        needH = ext.cy + 2 * pad;
+        measured = needW <= static_cast<int>(kBadgeTexW) && needH <= static_cast<int>(kBadgeTexH);
+    }
+    if (!measured) {
+        SelectObject(dc, oldFont);
+        DeleteObject(font);
+        DeleteDC(dc);
+        return false;  // the caller clamps the size; this is the belt to that braces
+    }
+
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = needW;
+    bi.bmiHeader.biHeight = -needH;  // top-down, so row 0 is the top row
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib || !bits) {
+        SelectObject(dc, oldFont);
+        DeleteObject(font);
+        if (dib) DeleteObject(dib);
+        DeleteDC(dc);
+        return false;
+    }
+    HGDIOBJ oldBmp = SelectObject(dc, dib);
+    memset(bits, 0, static_cast<size_t>(needW) * needH * 4);  // black, so the ink IS the coverage
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    TextOutW(dc, pad, pad, text.c_str(), static_cast<int>(text.size()));
+    GdiFlush();
+
+    // White on black with greyscale antialiasing: the blue channel IS the
+    // coverage of the glyph at that pixel, 0..255.
+    const auto* px = static_cast<const uint8_t*>(bits);
+    std::vector<uint8_t> cov(static_cast<size_t>(needW) * needH);
+    for (int y = 0; y < needH; ++y) {
+        for (int x = 0; x < needW; ++x)
+            cov[static_cast<size_t>(y) * needW + x] = px[(static_cast<size_t>(y) * needW + x) * 4];
+    }
+
+    SelectObject(dc, oldBmp);
+    SelectObject(dc, oldFont);
+    DeleteObject(dib);
+    DeleteObject(font);
+    DeleteDC(dc);
+
+    // The halo: the coverage dilated by two pixels, then box-blurred 5x5 so it
+    // falls off instead of ending in a hard edge of ours. Both passes run here,
+    // once per string change - in the shader this would be fifty taps per pixel
+    // per output tick, which is exactly the cost this design exists to avoid.
+    const size_t n = static_cast<size_t>(needW) * needH;
+    std::vector<uint8_t> dil(n, 0);
+    for (int y = 0; y < needH; ++y) {
+        for (int x = 0; x < needW; ++x) {
+            uint8_t o = 0;
+            for (int dy = -2; dy <= 2; ++dy) {
+                const int sy = y + dy;
+                if (sy < 0 || sy >= needH) continue;
+                for (int dx = -2; dx <= 2; ++dx) {
+                    const int sx = x + dx;
+                    if (sx < 0 || sx >= needW) continue;
+                    o = (std::max)(o, cov[static_cast<size_t>(sy) * needW + sx]);
+                }
             }
+            dil[static_cast<size_t>(y) * needW + x] = o;
         }
     }
-    if (count == 0) return false;
-    const float tw = static_cast<float>((count * 5 + (count - 1)) * scale);
-    const float th = static_cast<float>(7 * scale);
-    // Whole pixels: a glyph edge on a half pixel would shimmer as the width changes.
-    cb.rect[0] = std::floor(right - tw);
-    cb.rect[1] = std::floor(top);
+    badgePixels.assign(n * 4, 0);
+    for (int y = 0; y < needH; ++y) {
+        for (int x = 0; x < needW; ++x) {
+            int sum = 0, cnt = 0;
+            for (int dy = -2; dy <= 2; ++dy) {
+                const int sy = y + dy;
+                if (sy < 0 || sy >= needH) continue;
+                for (int dx = -2; dx <= 2; ++dx) {
+                    const int sx = x + dx;
+                    if (sx < 0 || sx >= needW) continue;
+                    sum += dil[static_cast<size_t>(sy) * needW + sx];
+                    ++cnt;
+                }
+            }
+            const size_t o4 = (static_cast<size_t>(y) * needW + x) * 4;
+            badgePixels[o4 + 0] = cov[static_cast<size_t>(y) * needW + x];       // glyph
+            badgePixels[o4 + 1] = static_cast<uint8_t>(cnt ? sum / cnt : 0);     // halo
+        }
+    }
+
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(ctx->Map(badgeTex.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return false;
+    auto* dst = static_cast<uint8_t*>(m.pData);
+    // WRITE_DISCARD hands back an undefined buffer, so every row has to be
+    // written, not just the used corner - otherwise the previous string's
+    // pixels can come back as residue beside the new one.
+    for (UINT y = 0; y < kBadgeTexH; ++y) {
+        uint8_t* row = dst + static_cast<size_t>(y) * m.RowPitch;
+        if (static_cast<int>(y) < needH) {
+            memcpy(row, &badgePixels[static_cast<size_t>(y) * needW * 4],
+                   static_cast<size_t>(needW) * 4);
+            memset(row + static_cast<size_t>(needW) * 4, 0,
+                   static_cast<size_t>(kBadgeTexW - needW) * 4);
+        } else {
+            memset(row, 0, static_cast<size_t>(kBadgeTexW) * 4);
+        }
+    }
+    ctx->Unmap(badgeTex.Get(), 0);
+
+    badgeText = text;
+    badgeFontPx = fontPx;
+    badgeInkW = needW;
+    badgeInkH = needH;
+    return true;
+}
+
+bool Synth::DrawFpsText(ID3D11RenderTargetView* rtv, UINT w, UINT h, float right, float top,
+                        int fontPx, const std::wstring& text) {
+    Impl& d = *impl_;
+    if (!d.ctx || !rtv || !d.psText || !d.badgeSrv) return false;
+    // The clamp is what guarantees the string fits the fixed texture. Below 10 px
+    // the radius-2 halo starts swallowing the strokes.
+    fontPx = (std::min)(Impl::kBadgeMaxFontPx, (std::max)(10, fontPx));
+    if (!d.RasterizeBadge(text, fontPx)) {
+        // Say it once. The failure is invisible otherwise - the readout simply
+        // stops appearing - and the only way here is a string that outgrew the
+        // texture, which is a bug, not a condition.
+        if (!d.badgeFailLogged) {
+            d.badgeFailLogged = true;
+            LogErr("frame rate readout: could not rasterise \"%s\" at %d px - it will not be shown",
+                   Narrow(text).c_str(), fontPx);
+        }
+        return false;
+    }
+    d.badgeFailLogged = false;
+
+    const float tw = static_cast<float>(d.badgeInkW);
+    const float th = static_cast<float>(d.badgeInkH);
+    TextCb cb{};
+    // Whole pixels: the text is read back with Load(), so a half-pixel origin
+    // would shift the glyphs' sampling grid and make them crawl as the numbers
+    // change width. The pad is added back so the caller's inset measures to the
+    // GLYPHS, not to the halo's box - the halo is ours, and must not push the
+    // numbers away from the corner the owner placed them in.
+    cb.rect[0] = std::floor(right + Impl::kBadgePad - tw);
+    cb.rect[1] = std::floor(top - Impl::kBadgePad);
     cb.rect[2] = tw;
     cb.rect[3] = th;
-    cb.ink[0] = cb.ink[1] = cb.ink[2] = 0.92f;  // near-white, linear light
+    cb.ink[0] = cb.ink[1] = cb.ink[2] = 1.0f;  // white, linear light
     cb.ink[3] = 1.0f;
-    cb.misc[1] = static_cast<float>(scale);
-    cb.misc[2] = static_cast<float>(count);
-    memcpy(cb.font, d.fontPacked, sizeof(cb.font));
+    cb.misc[1] = 0.90f;  // halo opacity
 
     D3D11_MAPPED_SUBRESOURCE m{};
     if (SUCCEEDED(d.ctx->Map(d.cbBadge.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -1947,35 +2160,40 @@ bool Synth::DrawFpsText(ID3D11RenderTargetView* rtv, UINT w, UINT h, float right
     vp.Height = static_cast<float>(h);
     vp.MaxDepth = 1.0f;
 
-    // The text box plus its one-pixel outline, and nothing else is touched.
+    // The text box and nothing else is touched; the outline is already inside it.
     D3D11_RECT sc = {};
-    sc.left = (std::max)(0L, static_cast<LONG>(cb.rect[0]) - 1);
-    sc.top = (std::max)(0L, static_cast<LONG>(cb.rect[1]) - 1);
-    sc.right = (std::min)(static_cast<LONG>(w), static_cast<LONG>(cb.rect[0] + tw) + 1);
-    sc.bottom = (std::min)(static_cast<LONG>(h), static_cast<LONG>(cb.rect[1] + th) + 1);
+    sc.left = (std::max)(0L, static_cast<LONG>(cb.rect[0]));
+    sc.top = (std::max)(0L, static_cast<LONG>(cb.rect[1]));
+    sc.right = (std::min)(static_cast<LONG>(w), static_cast<LONG>(cb.rect[0] + tw));
+    sc.bottom = (std::min)(static_cast<LONG>(h), static_cast<LONG>(cb.rect[1] + th));
     if (sc.right <= sc.left || sc.bottom <= sc.top) return false;
 
     ID3D11Buffer* cbs[1] = {d.cbBadge.Get()};
+    ID3D11ShaderResourceView* srvs[1] = {d.badgeSrv.Get()};
     ID3D11RenderTargetView* rtvs[1] = {rtv};
     d.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     d.ctx->IASetInputLayout(nullptr);
     d.ctx->VSSetShader(d.vs.Get(), nullptr, 0);
     d.ctx->PSSetShader(d.psText.Get(), nullptr, 0);
     d.ctx->PSSetConstantBuffers(3, 1, cbs);
+    d.ctx->PSSetShaderResources(10, 1, srvs);
     d.ctx->RSSetViewports(1, &vp);
     d.ctx->RSSetScissorRects(1, &sc);
     d.ctx->RSSetState(d.rasterScissor.Get());
-    d.ctx->OMSetBlendState(d.blendAlpha.Get(), nullptr, 0xFFFFFFFF);
+    d.ctx->OMSetBlendState(d.blendPremul.Get(), nullptr, 0xFFFFFFFF);
     d.ctx->OMSetDepthStencilState(d.depthOff.Get(), 0);
     d.ctx->OMSetRenderTargets(1, rtvs, nullptr);
     d.ctx->Draw(3, 0);
 
+    ID3D11ShaderResourceView* noSrv[1] = {nullptr};
+    d.ctx->PSSetShaderResources(10, 1, noSrv);
     d.ctx->RSSetState(d.raster.Get());
     d.ctx->OMSetBlendState(d.blendOff.Get(), nullptr, 0xFFFFFFFF);
     ID3D11RenderTargetView* noRt[1] = {nullptr};
     d.ctx->OMSetRenderTargets(1, noRt, nullptr);
     return true;
 }
+
 
 bool Synth::Resize(UINT w, UINT h, std::string* err, UINT cellPx) {
     Impl& d = *impl_;
@@ -2401,7 +2619,7 @@ bool Synth::PrepareMotion(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView*
                              Impl::kSeedCellPx);
             d.RunFillHint(d.seedSrv[1].Get());
             // DEBUG (env NSP_HINT_STATS): what the hint buffer NVOFA reads actually holds.
-            static const bool kHintStats = getenv("NSP_HINT_STATS") != nullptr;
+            static const bool kHintStats = EnvSet("NSP_HINT_STATS");
             if (kHintStats && d.ofa.HintUav()) {
                 ComPtr<ID3D11Resource> hres;
                 d.ofa.HintUav()->GetResource(hres.GetAddressOf());
@@ -2487,8 +2705,8 @@ bool Synth::PrepareMotion(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView*
             // which is precisely where it must not.
             // DEBUG (P21 determinism): NSP_HASH_FIELDS=all|raw|pre|post reads back
             // and hashes the field at those stages; every readback is also a sync point.
-            static const char* kHashEnv = getenv("NSP_HASH_FIELDS");
-            const std::string hashWhat = kHashEnv ? kHashEnv : "";
+            static const std::string kHashEnv = EnvValue("NSP_HASH_FIELDS");
+            const std::string& hashWhat = kHashEnv;
             const bool hRaw = hashWhat == "all" || hashWhat == "raw" || hashWhat == "1";
             const bool hMid = hashWhat == "all" || hashWhat == "1";
             const bool hPre = hMid || hashWhat == "pre";

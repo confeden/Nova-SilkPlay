@@ -1,0 +1,17 @@
+Nova SilkPlay - beta software
+=============================
+
+This is a BETA build. It is unfinished, it is expected to contain defects, and
+its behaviour may change without notice in any later build.
+
+Permission is granted to install and use this build on your own computer for
+personal, non-commercial purposes only. Commercial use, redistribution and
+resale are not permitted.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. YOU USE IT AT YOUR OWN
+RISK, AND NO LIABILITY IS ACCEPTED FOR ANY DAMAGE, DATA LOSS OR OTHER HARM
+ARISING FROM ITS USE.
+
+2026

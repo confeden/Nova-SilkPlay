@@ -245,6 +245,12 @@ def run_clip(name, url, start, a, primary):
     out = {"clip": name, "url": url, "start": start}
     # A previous run that did not shut Chrome down cleanly leaves this file behind,
     # and launch_chrome would then read the dead instance's port.
+    # ABSOLUTE, always. Chrome ignores a relative --user-data-dir and falls back to the
+    # user's DEFAULT profile, so the launch silently joins their already-running browser:
+    # no throwaway profile is created, no DevToolsActivePort is ever written, every arm
+    # times out - and the URL opens as a tab in THEIR window. MEASURED 2026-09-20 with
+    # --out runs/beta-0920; the same command with an absolute profile path works.
+    a.profile = os.path.abspath(a.profile)
     stale = os.path.join(a.profile, "DevToolsActivePort")
     if os.path.exists(stale):
         os.remove(stale)

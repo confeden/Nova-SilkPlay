@@ -11,7 +11,20 @@ namespace {
 // so plain (non-atomic) variables are correct, no locking is needed.
 bool             g_started    = false;
 bool             g_dirty      = false;
+// A SECOND, independent dirty flag for EVENT_SYSTEM_FOREGROUND only. The game gate
+// needs to know the foreground changed, and it must not consume g_dirty: that one
+// belongs to the occlusion test, and a shared flag would let whichever consumer
+// polled first swallow the other's notification.
+bool             g_fgDirty    = false;
 bool             g_moveSize   = false;
+// WHO is being dragged and SINCE WHEN. MOVESIZEEND is posted by the window
+// being moved, so a window destroyed mid-drag - a crashed browser, a display
+// unplugged, a session switch - never sends it. The latch then stayed true for
+// the rest of the run, and the re-engage guard in main.cpp reads it: frame
+// generation never came back until the program was restarted, silently (beta
+// audit, 2026-09-20). A drag nobody ended is over.
+HWND             g_moveSizeHwnd = nullptr;
+int64_t          g_moveSizeQpc = 0;
 uint64_t         g_eventsSeen = 0;
 
 // One handle per hooked event range.
@@ -38,8 +51,18 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
     }
 
     // Track move/size so the caller can avoid redundant queries mid-drag.
-    if (event == EVENT_SYSTEM_MOVESIZESTART) g_moveSize = true;
-    else if (event == EVENT_SYSTEM_MOVESIZEEND) g_moveSize = false;
+    if (event == EVENT_SYSTEM_MOVESIZESTART) {
+        g_moveSize = true;
+        g_moveSizeHwnd = hwnd;
+        g_moveSizeQpc = QpcNow();
+    } else if (event == EVENT_SYSTEM_MOVESIZEEND) {
+        g_moveSize = false;
+        g_moveSizeHwnd = nullptr;
+    }
+
+    // No new hook: EVENT_SYSTEM_FOREGROUND is already the first range in kRanges,
+    // and WINEVENT_SKIPOWNPROCESS keeps our own Settings window out of it.
+    if (event == EVENT_SYSTEM_FOREGROUND) g_fgDirty = true;
 
     g_dirty = true;
     ++g_eventsSeen;
@@ -90,7 +113,9 @@ bool WindowWatch::Start() {
 
     g_started    = true;
     g_dirty      = false;
+    g_fgDirty    = false;
     g_moveSize   = false;
+    g_moveSizeHwnd = nullptr;
     g_eventsSeen = 0;
     return true;
 }
@@ -104,7 +129,9 @@ void WindowWatch::Stop() {
         }
     }
     g_started  = false;
+    g_fgDirty  = false;
     g_moveSize = false;
+    g_moveSizeHwnd = nullptr;
 }
 
 bool WindowWatch::TakeDirty() {
@@ -113,7 +140,27 @@ bool WindowWatch::TakeDirty() {
     return true;
 }
 
-bool WindowWatch::MoveSizeActive() const { return g_moveSize; }
+bool WindowWatch::TakeForegroundChanged() {
+    if (!g_fgDirty) return false;
+    g_fgDirty = false;
+    return true;
+}
+
+bool WindowWatch::MoveSizeActive() const {
+    if (!g_moveSize) return false;
+    // Five seconds is far longer than any drag the caller cares about - it only
+    // uses this to raise the occlusion cadence and to hold off a re-engage - and
+    // far shorter than "for ever", which is what the bug was.
+    if (!IsWindow(g_moveSizeHwnd) || QpcToSec(QpcNow() - g_moveSizeQpc) > 5.0) {
+        Log("window watch: a move/size that began %.1f s ago never ended%s - clearing it",
+            QpcToSec(QpcNow() - g_moveSizeQpc),
+            IsWindow(g_moveSizeHwnd) ? "" : " (its window is gone)");
+        g_moveSize = false;
+        g_moveSizeHwnd = nullptr;
+        return false;
+    }
+    return true;
+}
 
 uint64_t WindowWatch::EventsSeen() const { return g_eventsSeen; }
 
