@@ -445,10 +445,27 @@ def launch_chrome(
     check_port_bindable(port)
     if user_data_dir is None:
         user_data_dir = tempfile.mkdtemp(prefix="chrome_cdp_")
+    # "Profile error occurred - Your preferences file is corrupt or invalid" popped up over the
+    # owner's work during runs (2026-10-06). Cause: on a FRESH profile under %TEMP% Chrome
+    # sometimes reads back an EMPTY "Local State" a few ms after creating it (the profile then
+    # holds a 0-byte "Local State.bad" and orphaned *.tmp files from that same millisecond -
+    # a write raced by something scanning new files in TEMP), and reports it with a modal
+    # dialog. A valid "Local State" written before launch leaves nothing empty to read, and
+    # --noerrdialogs keeps any such dialog off the screen: a throwaway profile has no settings
+    # worth recovering, and a dialog would steal the focus (D34).
+    os.makedirs(user_data_dir, exist_ok=True)
+    local_state = os.path.join(user_data_dir, "Local State")
+    try:
+        if not os.path.exists(local_state) or os.path.getsize(local_state) == 0:
+            with open(local_state, "w", encoding="utf-8") as f:
+                f.write("{}")
+    except OSError:
+        pass
     args = [
         CHROME_EXE,
         f"--remote-debugging-port={port}",
         f"--user-data-dir={user_data_dir}",
+        "--noerrdialogs",
         "--no-first-run",
         "--no-default-browser-check",
         "--autoplay-policy=no-user-gesture-required",

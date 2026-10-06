@@ -20,7 +20,7 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-set "SOURCES=main.cpp nsp_common.cpp nsp_overlay.cpp nsp_capture.cpp nsp_synth.cpp nsp_dump.cpp nsp_ofa.cpp nsp_image.cpp nsp_offline.cpp nsp_tray.cpp nsp_winwatch.cpp nsp_settings.cpp nsp_settings_window.cpp nsp_ui_text.cpp nsp_gamegate.cpp nsp_autostart.cpp nsp_drm.cpp"
+set "SOURCES=main.cpp nsp_common.cpp nsp_overlay.cpp nsp_capture.cpp nsp_synth.cpp nsp_dump.cpp nsp_ofa.cpp nsp_image.cpp nsp_offline.cpp nsp_tray.cpp nsp_winwatch.cpp nsp_settings.cpp nsp_settings_window.cpp nsp_ui_text.cpp nsp_gamegate.cpp nsp_autostart.cpp nsp_drm.cpp nsp_rectfind.cpp nsp_mediawatch.cpp"
 
 for %%F in (%SOURCES% silkplay.rc silkplay.manifest res\silk.ico res\silk_off.ico) do (
     if not exist "%%F" (

@@ -16,6 +16,8 @@
 //     That is a known, accepted defect at prototype stage — see D23.
 
 #include "nsp_capture.h"
+#include "nsp_mediawatch.h"
+#include "nsp_rectfind.h"
 #include "nsp_autostart.h"
 #include "nsp_common.h"
 #include "nsp_drm.h"
@@ -105,6 +107,8 @@ struct AppOptions {
     // would put the overlay over the whole page, and with the cursor gate gone
     // every interaction with that page would be shown a source period late.
     bool   allowWindowed = false;   // --allow-windowed
+    bool   fullscreenOnly = false;  // --fullscreen-only: no windowed video (P11 off)
+    bool   scoutAlways = false;     // --scout-always: lab, look for a windowed video without a media session
     bool   pauseForWidgets = false; // --pause-for-widgets: the strict occlusion rule
     bool   overlayLayered = true;   // --overlay-unlayered: measurement of LAYERED's cost only
     bool   logDirty = false;        // --log-dirty: per-capture video-frame test verdicts
@@ -194,8 +198,11 @@ void PrintUsage() {
         "  --stall-ms F             hide the overlay after this long with no new\n"
         "                           source frame (default 400)\n"
         "  --manual                 start hidden; Ctrl+Alt+Q or O shows it\n"
-        "  --allow-windowed         also attach to a browser that is not fullscreen\n"
-        "                           (default: fullscreen only; --rect implies it)\n"
+        "  --allow-windowed         lab: treat a windowed browser's WHOLE client area as the\n"
+        "                           video (--rect implies it)\n"
+        "  --fullscreen-only        attach to a fullscreen browser only; by default a video\n"
+        "                           playing in a windowed browser is found from DWM's\n"
+        "                           damage (P11) and generated in place\n"
         "  --pause-for-widgets      small always-on-top windows (widgets, toasts,\n"
         "                           tooltips) pause generation too; default: ignored\n"
         "  --cursor-gate            pause while the pointer is on the video (old\n"
@@ -341,6 +348,10 @@ bool ParseArgs(int argc, char** argv, AppOptions* opt) {
             opt->overlayTopmost = true;
         } else if (a == "--allow-windowed") {
             opt->allowWindowed = true;
+        } else if (a == "--fullscreen-only") {
+            opt->fullscreenOnly = true;
+        } else if (a == "--scout-always") {
+            opt->scoutAlways = true;
         } else if (a == "--pause-for-widgets") {
             opt->pauseForWidgets = true;
         } else if (a == "--overlay-unlayered") {
@@ -775,9 +786,32 @@ int HotkeyIdForVk(DWORD vk) {
 //    would leave other programs believing the key is still held.
 bool g_chordDown[kHkQuit + 1] = {};
 
+// INPUT THAT CAN MOVE A WINDOWED VIDEO (P11). The geometry guard notices a scroll from the
+// capture, but a capture arrives after DWM has already shown the scrolled page - one frame
+// of our picture over the old place. The input that causes a scroll arrives BEFORE it, so
+// a wheel notch over the browser, or a scrolling key while it has the focus, hides the
+// overlay first; it comes back once the video's own rect has been seen again. Observation
+// only: nothing is consumed, nothing is delayed.
+std::atomic<HWND> g_inputTarget{nullptr};       // the windowed browser, or null
+std::atomic<int64_t> g_inputPreemptQpc{0};      // QpcNow() of the last such input
+
+bool IsScrollKey(DWORD vk) {
+    switch (vk) {
+        case VK_UP: case VK_DOWN: case VK_PRIOR: case VK_NEXT: case VK_HOME: case VK_END:
+        case VK_SPACE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 LRESULT CALLBACK LowLevelKeyProc(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION) {
         const auto* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
+        if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && IsScrollKey(k->vkCode)) {
+            const HWND t = g_inputTarget.load(std::memory_order_relaxed);
+            if (t && GetForegroundWindow() == t) g_inputPreemptQpc.store(QpcNow(), std::memory_order_release);
+        }
         const int id = HotkeyIdForVk(k->vkCode);
         if (id != 0 && id <= kHkQuit) {
             if (wp == WM_KEYUP || wp == WM_SYSKEYUP) {
@@ -818,18 +852,65 @@ LRESULT CALLBACK LowLevelKeyProc(int code, WPARAM wp, LPARAM lp) {
 //
 // A dedicated thread does nothing but GetMessage, so the callback returns in
 // microseconds no matter what the renderer is doing.
+// Raw input, not a WH_MOUSE_LL hook: a low-level mouse hook would put every mouse event on
+// the machine behind this thread; raw input with RIDEV_INPUTSINK is a copy delivered after
+// the fact, so nothing anyone does with the mouse can wait for us.
+LRESULT CALLBACK InputSinkProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_INPUT) {
+        RAWINPUT ri{};
+        UINT size = sizeof(ri);
+        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &ri, &size,
+                            sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) &&
+            ri.header.dwType == RIM_TYPEMOUSE &&
+            (ri.data.mouse.usButtonFlags & (RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL))) {
+            // The pointer inside the browser's window rect, not WindowFromPoint: that one
+            // can SendMessage(WM_NCHITTEST) to a hung window, and this thread also carries the
+            // keyboard hook, which must never wait (review, 2026-10-06). A wheel over another
+            // window that overlaps the browser only costs a brief, harmless hide.
+            const HWND t = g_inputTarget.load(std::memory_order_relaxed);
+            POINT pt{};
+            RECT wr{};
+            if (t && GetCursorPos(&pt) && GetWindowRect(t, &wr) && PtInRect(&wr, pt))
+                g_inputPreemptQpc.store(QpcNow(), std::memory_order_release);
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+HWND CreateInputSink() {
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc = InputSinkProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"NovaSilkPlay.InputSink";
+    RegisterClassExW(&wc);
+    HWND h = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
+                             wc.hInstance, nullptr);
+    if (!h) return nullptr;
+    RAWINPUTDEVICE rid{0x01, 0x02, RIDEV_INPUTSINK, h};  // generic desktop / mouse
+    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+        LogErr("raw mouse input unavailable (GetLastError=%lu) - a wheel scroll of a windowed "
+               "video is noticed one frame late, from the capture", GetLastError());
+        DestroyWindow(h);
+        return nullptr;
+    }
+    return h;
+}
+
 DWORD WINAPI HookThreadProc(LPVOID param) {
     g_hookThread = GetCurrentThreadId();
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyProc, GetModuleHandleW(nullptr), 0);
+    const HWND sink = CreateInputSink();
     SetEvent(static_cast<HANDLE>(param));  // Install() may now read g_kbHook
-    if (!g_kbHook) return 0;
+    if (!g_kbHook && !sink) return 0;
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        // WM_NSP_HOTKEY is posted to g_mainThread by the callback; nothing is
-        // expected here except WM_QUIT at shutdown.
+        // WM_NSP_HOTKEY is posted to g_mainThread by the callback; the only window here
+        // is the raw-input sink, and WM_QUIT ends the loop at shutdown.
+        DispatchMessageW(&msg);
     }
-    UnhookWindowsHookEx(g_kbHook);
+    if (sink) DestroyWindow(sink);
+    if (g_kbHook) UnhookWindowsHookEx(g_kbHook);
     g_kbHook = nullptr;
     return 0;
 }
@@ -936,6 +1017,11 @@ public:
 private:
     bool ResolveTarget();
     bool NeedFullscreen() const { return !opt_.allowWindowed && !opt_.haveRect; }
+    // P11: a video in a WINDOWED browser is found from DWM's damage and generated in place.
+    bool WindowedAuto() const { return NeedFullscreen() && !opt_.fullscreenOnly; }
+    void Scout(int64_t now);
+    void StopScout();
+    void GuardCapture();
     bool Engage();
     void Disengage();
     void PollCapture();
@@ -987,6 +1073,40 @@ private:
     int64_t lastObscuredCheck_ = 0;
     int64_t cursorLeftAt_ = 0;
     WindowWatch watch_;
+    // P11, the windowed video. Scouting runs only while nothing is engaged, the browser is
+    // windowed and Windows says it is playing media; the guard runs while engaged on the
+    // rect the scout found, and hides the overlay the moment the page may have moved.
+    MediaWatch media_;
+    std::unique_ptr<DamageScout> scout_;
+    TargetWindow scoutTarget_{};
+    RectFinder finder_;
+    int64_t scoutLookQpc_ = 0;       // last target lookup while scouting (4 Hz)
+    int64_t scoutStartQpc_ = 0;
+    int64_t scoutLogQpc_ = 0;
+    bool haveAutoRect_ = false;      // the scout found a video: engage on it next
+    int64_t autoRectQpc_ = 0;
+    TargetWindow autoTarget_{};      // the window as it was when the rect was found
+    RECT autoSurface_{};             // the video rect, WGC surface coordinates
+    LONG autoSurfW_ = 0, autoSurfH_ = 0;
+    std::vector<DamageSig> autoCompanions_;
+    bool engageWindowed_ = false;    // ResolveTarget chose the found rect
+    bool guardActive_ = false;       // engaged on a found rect: the guard decides showing
+    GeometryGuard guard_;
+    bool guardHidLogged_ = false;
+    int64_t lastPreemptSeen_ = 0;
+    uint64_t guardHides_ = 0, guardGiveUps_ = 0;
+    std::vector<TimedDamage> damageBuf_;
+    bool engageNow_ = false;         // skip the 1 s re-engage wait once
+    bool guardWantsRescout_ = false; // the guard gave up: disengage from the main loop
+    int64_t scoutSearchQpc_ = 0;     // when the current search began (the cost duty cycle)
+    int64_t scoutDecideQpc_ = 0;     // last RectFinder::Found (10 Hz)
+    RECT scoutViewport_{};           // the page area the finder was reset with
+    RECT autoViewport_{};            // ... and the one the found rect came with
+    bool scoutNoViewportLogged_ = false;
+    int64_t rescoutHoldUntil_ = 0;   // repeated short-lived windowed engagements back off
+    int shortGiveUps_ = 0;
+    bool shownThisEngage_ = false;   // the overlay showed at least once since Engage
+    int64_t scoutFailQpc_ = 0;       // a scout that cannot start is retried after 10 s
     uint64_t occlChecks_ = 0;
     double occlUsSum_ = 0.0, occlUsMax_ = 0.0;
     uint64_t zFixesAtStats_ = 0;
@@ -1058,8 +1178,17 @@ bool App::ResolveTarget() {
         if (verbose) Log("no browser is selected in Settings - nothing to capture");
         return false;
     }
-    if (!FindTarget(opt_.targetClass, opt_.targetTitle, opt_.targetPid, &t, opt_.targetExe,
-                    NeedFullscreen(), verbose)) {
+    engageWindowed_ = false;
+    // A FULLSCREEN browser first, always: with a second Chrome window in front of it (or just
+    // bigger) a single search would pick that one and the fullscreen video would never engage
+    // - the pre-P11 rule, kept exactly (review, 2026-10-06). Only when there is none does the
+    // windowed path get to look.
+    const bool haveFullscreen =
+        NeedFullscreen() &&
+        FindTarget(opt_.targetClass, opt_.targetTitle, opt_.targetPid, &t, opt_.targetExe, true, false);
+    if (!haveFullscreen &&
+        !FindTarget(opt_.targetClass, opt_.targetTitle, opt_.targetPid, &t, opt_.targetExe,
+                    NeedFullscreen() && !WindowedAuto(), verbose)) {
         if (!verbose) return false;
         if (NeedFullscreen()) {
             Log("waiting for a fullscreen browser window (press F on the video, or F11); "
@@ -1071,17 +1200,37 @@ bool App::ResolveTarget() {
         }
         return false;
     }
-    target_ = t;
-
-    if (!opt_.haveRect) {
+    if (WindowedAuto() && !t.fullscreen) {
+        // A windowed browser: only on the rect the scout found in THIS window, as it stood
+        // then. Anything else - moved, resized, another window, a find gone stale - and the
+        // scout looks again; the whole client is never taken for the video (D27, I10).
+        const bool fresh = haveAutoRect_ && autoTarget_.hwnd == t.hwnd &&
+                           memcmp(&autoTarget_.clientScreen, &t.clientScreen, sizeof(RECT)) == 0 &&
+                           memcmp(&autoTarget_.frameBounds, &t.frameBounds, sizeof(RECT)) == 0 &&
+                           QpcToSec(QpcNow() - autoRectQpc_) < 3.0;
+        if (!fresh) {
+            haveAutoRect_ = false;
+            if (verbose)
+                Log("browser is windowed - waiting for a video playing in it (or fullscreen)");
+            return false;
+        }
+        target_ = t;
+        const LONG sx = t.frameBounds.left + autoSurface_.left - t.clientScreen.left;
+        const LONG sy = t.frameBounds.top + autoSurface_.top - t.clientScreen.top;
+        videoClient_ = RECT{sx, sy, sx + RectW(autoSurface_), sy + RectH(autoSurface_)};
+        engageWindowed_ = true;
+    } else if (!opt_.haveRect) {
+        target_ = t;
         // Whole client area. For fullscreen video that IS the video rect.
         videoClient_ = RECT{0, 0, RectW(t.clientScreen), RectH(t.clientScreen)};
     } else if (opt_.rectIsScreen) {
+        target_ = t;
         videoClient_ = RECT{opt_.rectClient.left - t.clientScreen.left,
                             opt_.rectClient.top - t.clientScreen.top,
                             opt_.rectClient.right - t.clientScreen.left,
                             opt_.rectClient.bottom - t.clientScreen.top};
     } else {
+        target_ = t;
         videoClient_ = opt_.rectClient;
     }
 
@@ -1236,6 +1385,18 @@ bool App::Engage() {
     statsQpc_ = QpcNow();
     presents_ = 0;
     framesAtStats_ = 0;
+    guardActive_ = engageWindowed_;
+    shownThisEngage_ = false;
+    capture_->EnableDamage(guardActive_);
+    if (guardActive_) {
+        guard_.Begin(Qpc100nsNow() / 1e7, autoSurface_, autoCompanions_, autoSurfW_, autoSurfH_,
+                     autoViewport_);
+        guardHidLogged_ = false;
+        lastPreemptSeen_ = g_inputPreemptQpc.load(std::memory_order_acquire);
+        g_inputTarget.store(target_.hwnd, std::memory_order_release);
+        Log("windowed video: the overlay follows the geometry guard (surface rect %s, %zu "
+            "companion shapes)", RectStr(autoSurface_).c_str(), autoCompanions_.size());
+    }
     Log("engaged, mode=%s, overlay hidden until the first source pair arrives", ModeName(opt_.mode));
     return true;
 }
@@ -1275,6 +1436,14 @@ void App::Disengage() {
     // while disengaged costs nothing and fails OPEN, which is the gate's first
     // contract. The pid is replaced by the next Engage.
     if (overlay_) overlay_->Hide();
+    // The page was not watched while disengaged: whatever rect the scout found is no
+    // longer known to be where the video is.
+    if (engaged_ && guardActive_) {
+        haveAutoRect_ = false;
+        scoutSearchQpc_ = QpcNow();  // look again at once, not on the cost duty cycle
+    }
+    guardActive_ = false;
+    g_inputTarget.store(nullptr, std::memory_order_release);
     zFixesAtStats_ = 0;
     framesAtStats_ = 0;
     capture_.reset();
@@ -1290,6 +1459,7 @@ void App::Disengage() {
 void App::PollCapture() {
     if (!engaged_) return;
     const int ingested = capture_->Poll();
+    if (guardActive_) GuardCapture();
     if (ingested > 0) {
         const double now100 = Qpc100nsNow();
         cadence_.OnFrame(capture_->NewestTime100ns(), now100);
@@ -1322,6 +1492,186 @@ void App::PollCapture() {
             motionCpuMs_ += QpcToMs(QpcNow() - t0);
             ++motionRuns_;
         }
+    }
+}
+
+void App::StopScout() { scout_.reset(); }
+
+// Chrome's page area: the largest visible Chrome_RenderWidgetHostHWND under the window.
+HWND FindRenderWidget(HWND top) {
+    struct Ctx {
+        HWND best = nullptr;
+        long long area = 0;
+    } ctx;
+    EnumChildWindows(
+        top,
+        [](HWND h, LPARAM lp) -> BOOL {
+            auto* c = reinterpret_cast<Ctx*>(lp);
+            wchar_t cls[64]{};
+            GetClassNameW(h, cls, 64);
+            RECT r{};
+            if (wcscmp(cls, L"Chrome_RenderWidgetHostHWND") == 0 && IsWindowVisible(h) &&
+                GetWindowRect(h, &r)) {
+                const long long a = static_cast<long long>(r.right - r.left) * (r.bottom - r.top);
+                if (a > c->area) {
+                    c->area = a;
+                    c->best = h;
+                }
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&ctx));
+    return ctx.best;
+}
+
+// P11. Runs every loop iteration; costs nothing unless a windowed Chrome is playing media.
+void App::Scout(int64_t now) {
+    // NOT gated on the DRM verdict: the DRM scanner reaches a clear verdict only for an
+    // engaged target, so gating the search on it would deadlock exactly like the game gate's
+    // exemption once did. The DRM gate still decides whether a picture is SHOWN.
+    const bool want = WindowedAuto() && !engaged_ && wantShown_ && !gamePaused_ &&
+                      !watch_.MoveSizeActive() && !haveAutoRect_ &&
+                      (opt_.targetFromCli || settings_.captureChrome) &&
+                      (opt_.scoutAlways || media_.State() != MediaState::kIdle) &&
+                      (scoutFailQpc_ == 0 || QpcToSec(now - scoutFailQpc_) > 10.0) &&
+                      now >= rescoutHoldUntil_;
+    if (!want) {
+        if (scout_) StopScout();
+        return;
+    }
+    if (QpcToSec(now - scoutLookQpc_) > 0.25) {
+        scoutLookQpc_ = now;
+        // A fullscreen browser anywhere is the ordinary path's: never scout beside it.
+        TargetWindow t{};
+        if (FindTarget(opt_.targetClass, opt_.targetTitle, opt_.targetPid, &t, opt_.targetExe,
+                       true, false) ||
+            !FindTarget(opt_.targetClass, opt_.targetTitle, opt_.targetPid, &t, opt_.targetExe,
+                        false, false) ||
+            IsIconic(t.hwnd)) {
+            if (scout_) StopScout();
+            return;
+        }
+        // The page area, re-read every lookup: bookmarks, an infobar or devtools change it
+        // without moving the window. Without it the finder cannot tell the whole page from a
+        // video, so no page area means no search (fail closed, I10).
+        RECT vp{};
+        if (const HWND rw = FindRenderWidget(t.hwnd)) {
+            RECT r{};
+            if (GetWindowRect(rw, &r))
+                vp = RECT{r.left - t.frameBounds.left, r.top - t.frameBounds.top,
+                          r.right - t.frameBounds.left, r.bottom - t.frameBounds.top};
+        }
+        if (RectEmpty(vp)) {
+            if (!scoutNoViewportLogged_)
+                LogErr("windowed video: no page area (Chrome_RenderWidgetHostHWND) in 0x%p - not "
+                       "looking for a video in it", static_cast<void*>(t.hwnd));
+            scoutNoViewportLogged_ = true;
+            if (scout_) StopScout();
+            return;
+        }
+        scoutNoViewportLogged_ = false;
+        // COST. Scouting is a capture of the whole window for as long as Chrome says it plays,
+        // and background music says that for hours. After 20 s without a find it looks for 5 s
+        // in every 20; a new page in the window (its title changes) starts it over.
+        if (t.hwnd != scoutTarget_.hwnd || t.title != scoutTarget_.title) scoutSearchQpc_ = now;
+        const double searching = QpcToSec(now - scoutSearchQpc_);
+        if (searching > 20.0 && fmod(searching - 20.0, 20.0) > 5.0) {
+            if (scout_) StopScout();
+            scoutTarget_ = t;  // keep the title, so the duty cycle is not reset
+            return;
+        }
+        const bool same = scout_ && scout_->Target() == t.hwnd &&
+                          memcmp(&scoutTarget_.clientScreen, &t.clientScreen, sizeof(RECT)) == 0 &&
+                          memcmp(&scoutTarget_.frameBounds, &t.frameBounds, sizeof(RECT)) == 0;
+        if (!same) {
+            StopScout();
+            scout_ = std::make_unique<DamageScout>();
+            std::string err;
+            if (!scout_->Start(t.hwnd, &err)) {
+                LogErr("windowed video: cannot watch the browser window (%s) - retrying in 10 s",
+                       err.c_str());
+                scout_.reset();
+                scoutFailQpc_ = now;
+                return;
+            }
+            scoutFailQpc_ = 0;
+            scoutStartQpc_ = now;
+            finder_.Reset(scout_->SurfaceW(), scout_->SurfaceH(), vp);
+            scoutViewport_ = vp;
+            Log("windowed video: looking for the video in 0x%p \"%s\" (media %s)",
+                static_cast<void*>(t.hwnd), Narrow(t.title).c_str(), MediaStateName(media_.State()));
+        } else if (memcmp(&vp, &scoutViewport_, sizeof(RECT)) != 0) {
+            finder_.Reset(scout_->SurfaceW(), scout_->SurfaceH(), vp);  // the page area moved
+            scoutViewport_ = vp;
+        }
+        scoutTarget_ = t;
+    }
+    if (!scout_) return;
+    damageBuf_.clear();
+    if (!scout_->Poll(&damageBuf_)) {
+        StopScout();  // closed or resized: the next lookup starts over
+        return;
+    }
+    for (const auto& d : damageBuf_) finder_.Add(d.tSec, d.d);
+    damageBuf_.clear();
+    if (QpcToSec(now - scoutLogQpc_) > 5.0 && QpcToSec(now - scoutStartQpc_) > 2.0) {
+        scoutLogQpc_ = now;
+        Log("windowed video: still looking - last second: %s",
+            finder_.Summary(Qpc100nsNow() / 1e7).c_str());
+    }
+    // Ten decisions a second are plenty for a rule that needs half a second of evidence.
+    if (QpcToSec(now - scoutDecideQpc_) < 0.1) return;
+    scoutDecideQpc_ = now;
+    RECT r{};
+    std::vector<DamageSig> comps;
+    if (finder_.Found(Qpc100nsNow() / 1e7, &r, &comps)) {
+        haveAutoRect_ = true;
+        autoRectQpc_ = now;
+        autoTarget_ = scoutTarget_;
+        autoSurface_ = r;
+        autoCompanions_ = comps;
+        autoSurfW_ = scout_->SurfaceW();
+        autoSurfH_ = scout_->SurfaceH();
+        autoViewport_ = scoutViewport_;
+        Log("windowed video found after %.1f s: surface rect %s (%ldx%ld), %zu companion shapes",
+            QpcToSec(now - scoutStartQpc_), RectStr(r).c_str(), RectW(r), RectH(r), comps.size());
+        Log("  last second: %s", finder_.Summary(Qpc100nsNow() / 1e7).c_str());
+        StopScout();
+        // Straight to the engage, unless engaging has been failing: the backoff stands.
+        if (!engageCostly_) engageNow_ = true;
+    }
+}
+
+// P11. Every capture's damage, and any input that can scroll, through the guard.
+void App::GuardCapture() {
+    capture_->TakeDamage(&damageBuf_);
+    for (const auto& d : damageBuf_) guard_.Add(d.tSec, d.d);
+    damageBuf_.clear();
+    const int64_t p = g_inputPreemptQpc.load(std::memory_order_acquire);
+    if (p != lastPreemptSeen_) {
+        lastPreemptSeen_ = p;
+        guard_.OnInput(QpcToSec(p));
+    }
+    const double nowSec = Qpc100nsNow() / 1e7;
+    guard_.Tick(nowSec);
+    if (guard_.Suspect()) {
+        if (overlay_ && overlay_->IsShown()) {
+            overlay_->Hide();
+            ++guardHides_;
+        }
+        if (!guardHidLogged_) {
+            guardHidLogged_ = true;
+            Log("windowed video: %s (last foreign damage %s) - overlay hidden until the video "
+                "rect is seen again", guard_.LastReason(), guard_.LastForeign().Str().c_str());
+        }
+    } else if (guardHidLogged_) {
+        guardHidLogged_ = false;
+        Log("windowed video: the video rect is confirmed again");
+    }
+    if (guard_.GiveUp(nowSec) && !guardWantsRescout_) {
+        ++guardGiveUps_;
+        guardWantsRescout_ = true;
+        Log("windowed video: the video rect did not come back - looking for the video again");
     }
 }
 
@@ -1577,10 +1927,11 @@ void App::Tick() {
     // page delivers the odd repaint a second apart, which is not a source to
     // interpolate and must not make the overlay blink in and out.
     if (opt_.autoShow && wantShown_ && !stalled_ && !obscured_ && !cursorOver_ && !gamePaused_ &&
-        !drmBlocked_ &&
+        !drmBlocked_ && !(guardActive_ && guard_.Suspect()) &&
         !overlay_->IsShown() && havePair &&
         cadence_.Ready()) {
         overlay_->Show();
+        shownThisEngage_ = true;
         Log("overlay shown (source %.2f fps, capture delay %.1f ms)", cadence_.Fps(),
             delay / 10000.0);
     }
@@ -1852,6 +2203,11 @@ int App::Run() {
     // is supposed to do. Exiting here instead was the single thing that made
     // this a "launch it at the right moment" utility rather than something that
     // can sit in the tray.
+    if (WindowedAuto()) {
+        media_.Start(L"chrome");
+        Log("windowed video: on - a video playing in a windowed Chrome is found from DWM's "
+            "damage (--fullscreen-only turns this off)");
+    }
     if (!Engage())
         Log("no target yet - waiting for a window matching class='%s'; Ctrl+Alt+X quits",
             Narrow(opt_.targetClass).c_str());
@@ -2106,6 +2462,25 @@ int App::Run() {
         // 2026-09-20). A tray utility the user has switched off must not keep a
         // capture session and a few hundred megabytes of GPU memory, and must
         // not heat the machine for a picture nobody sees.
+        if (guardWantsRescout_) {
+            guardWantsRescout_ = false;
+            if (engaged_) {
+                // Each give-up costs a device, an overlay and a capture session to rebuild. One
+                // after a scroll is the design, and so is one after the user changed the layout
+                // twice in ten seconds: an engagement that SHOWED a picture did its job. What
+                // backs off (1, 2, 4 ... 30 s) is a string of engagements that never showed one
+                // - a page whose damage keeps breaking the rect before it is ever confirmed.
+                if (shownThisEngage_) {
+                    shortGiveUps_ = 0;
+                } else if (++shortGiveUps_ >= 2) {
+                    const double hold = (std::min)(30.0, std::ldexp(1.0, shortGiveUps_ - 2));
+                    rescoutHoldUntil_ = now + static_cast<int64_t>(hold * QpcPerSecond());
+                    Log("windowed video: %d short-lived engagements in a row - looking again in %.0f s",
+                        shortGiveUps_, hold);
+                }
+                Disengage();
+            }
+        }
         if (!wantShown_ && engaged_) {
             Log("frame generation is off - releasing the capture session and the device");
             Disengage();
@@ -2200,7 +2575,7 @@ int App::Run() {
                     Log("target moved/resized: %s -> %s - re-engaging",
                         RectStr(target_.clientScreen).c_str(), RectStr(t.clientScreen).c_str());
                     Disengage();
-                } else if (NeedFullscreen() && !t.fullscreen) {
+                } else if (NeedFullscreen() && !guardActive_ && !t.fullscreen) {
                     Log("target left fullscreen - disengaging");
                     Disengage();
                 } else {
@@ -2243,6 +2618,11 @@ int App::Run() {
         // straight to the 10 s ceiling (review, 2026-09-20).
         const double reengageAfter =
             engageCostly_ ? (std::min)(10.0, 1.0 + 0.5 * static_cast<double>(costlyFails_)) : 1.0;
+        Scout(now);
+        if (engageNow_) {
+            engageNow_ = false;
+            if (!engageCostly_) lastReengageAttempt = 0;
+        }
         if (!engaged_ && wantShown_ && !gamePaused_ && !watch_.MoveSizeActive() &&
             QpcToSec(now - lastReengageAttempt) > reengageAfter) {
             lastReengageAttempt = now;
@@ -2281,7 +2661,9 @@ int App::Run() {
     // (OnConsoleCtrl) — an icon removed last could be killed with the process and linger in the
     // notification area until the pointer passes over it.
     tray_.Destroy();
+    StopScout();
     Disengage();
+    media_.Stop();
     watch_.Stop();
     UninstallHotkeys();
     return 0;

@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>NSP windowed page</title>
+<style>
+  body { margin: 0; font: 15px/1.5 Segoe UI, sans-serif; background: #f4f4f4; color: #222; }
+  body.dark { background: #0f0f0f; color: #ddd; }
+  header { position: sticky; top: 0; height: 56px; background: rgba(255,255,255,.92); border-bottom: 1px solid #ccc;
+           display: flex; align-items: center; padding: 0 16px; z-index: 5; }
+  body.dark header { background: rgba(15,15,15,.92); border-color: #333; }
+  #stage { position: relative; margin: 40px 0 0 40px; width: 960px; }
+  #stage.theater { margin: 20px auto 0; width: 1200px; }
+  #glow { position: absolute; left: -80px; top: -60px; width: calc(100% + 160px); height: calc(100% + 120px);
+          filter: blur(40px); opacity: .6; z-index: 0; display: none; }
+  body.glow #glow { display: block; }
+  video { position: relative; display: block; width: 100%; aspect-ratio: 960 / 400; background: #000; z-index: 1; }
+  .ytp-size-button { margin-top: 8px; }
+  p { max-width: 900px; margin: 18px 40px; }
+</style>
+</head>
+<body>
+<header><b>NSP windowed page</b>&nbsp;&nbsp;<input placeholder="search" style="width:300px"></header>
+<div id="stage">
+  <canvas id="glow" width="96" height="40"></canvas>
+  <video id="v" muted playsinline></video>
+  <button class="ytp-size-button" onclick="document.getElementById('stage').classList.toggle('theater')">theater</button>
+</div>
+<div id="text"></div>
+<script>
+// A deterministic 24 fps source: a canvas drawn on a fixed media clock, played through a
+// <video> via captureStream, so Chrome composites it the way it composites real video.
+const q = new URLSearchParams(location.search);
+const fps = +(q.get('fps') || 24);
+if (q.get('dark') === '1') document.body.classList.add('dark');
+if (q.get('glow') === '1') document.body.classList.add('glow');
+const src = document.createElement('canvas');
+src.width = 960; src.height = 400;
+const g = src.getContext('2d');
+let n = 0;
+function draw() {
+  const t = n / fps;
+  g.fillStyle = '#203040'; g.fillRect(0, 0, 960, 400);
+  for (let i = 0; i < 12; i++) {
+    g.fillStyle = `hsl(${(i * 30 + n) % 360},70%,55%)`;
+    const x = (i * 97 + t * 240) % 1100 - 70, y = 30 + i * 28;
+    g.fillRect(x, y, 70, 22);
+  }
+  g.fillStyle = '#fff'; g.font = '28px monospace'; g.fillText('frame ' + n, 20, 380);
+  n++;
+}
+draw();
+setInterval(draw, 1000 / fps);
+const v = document.getElementById('v');
+v.srcObject = src.captureStream(fps);
+v.play();
+// The ambient-mode stand-in: a blurred, enlarged copy of the picture, repainted at 12 Hz.
+const glow = document.getElementById('glow').getContext('2d');
+setInterval(() => { if (document.body.classList.contains('glow')) glow.drawImage(src, 0, 0, 96, 40); }, 1000 / 12);
+let text = '';
+for (let i = 0; i < 40; i++) text += `<p>Paragraph ${i}. Static page text below the video, so the page scrolls.</p>`;
+document.getElementById('text').innerHTML = text;
+</script>
+</body>
+</html>

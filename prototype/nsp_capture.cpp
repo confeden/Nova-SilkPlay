@@ -40,6 +40,23 @@ namespace wacc = winrt::Windows::Security::Authorization::AppCapabilityAccess;
 using DxgiInterfaceAccess = ::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
 
 constexpr DWORD kAccessRequestTimeoutMs = 5000;
+constexpr size_t kMaxDamageQueued = 256;
+
+// DWM's dirty regions of one frame as a DamageSig, in surface coordinates.
+DamageSig DamageFromRegions(
+    winrt::Windows::Foundation::Collections::IVectorView<winrt::Windows::Graphics::RectInt32> const& regions) {
+    DamageSig d;
+    const uint32_t n = regions.Size();
+    for (uint32_t i = 0; i < n; ++i) {
+        if (d.n == DamageSig::kMaxRects) {
+            d.overflow = true;
+            break;
+        }
+        const auto g = regions.GetAt(i);
+        d.r[d.n++] = RECT{g.X, g.Y, g.X + g.Width, g.Y + g.Height};
+    }
+    return d;
+}
 
 // ---------------------------------------------------------------------------
 // WHICH CAPTURED FRAMES ARE VIDEO FRAMES.
@@ -252,6 +269,9 @@ struct Capture::Impl {
     wgc::GraphicsCaptureSession session{nullptr};
     winrt::event_token closedToken{};
     std::shared_ptr<std::atomic<bool>> itemClosed = std::make_shared<std::atomic<bool>>(false);
+
+    std::vector<TimedDamage> damage;  // drained by TakeDamage (P11 geometry guard)
+    bool damageOn = false;
 
     bool started = false;
     bool needsReengage = false;
@@ -503,6 +523,16 @@ const RECT& Capture::SourceRect() const { return impl_->srcRect; }
 uint64_t Capture::FramesIngested() const { return impl_->framesIngested; }
 bool Capture::NeedsReengage() const { return impl_->needsReengage; }
 const std::string& Capture::StartupReport() const { return impl_->report; }
+
+void Capture::EnableDamage(bool on) {
+    impl_->damageOn = on;
+    if (!on) impl_->damage.clear();
+}
+
+void Capture::TakeDamage(std::vector<TimedDamage>* out) {
+    out->clear();
+    out->swap(impl_->damage);
+}
 
 ID3D11ShaderResourceView* Capture::NewestSrv() const {
     const Impl& s = *impl_;
@@ -833,6 +863,11 @@ int Capture::Poll() {
                         auto regions = f2.DirtyRegions();
                         haveRegions = true;
                         nRects = static_cast<int>(regions.Size());
+                        if (s.damageOn) {
+                            s.damage.push_back(TimedDamage{t100 / 1e7, DamageFromRegions(regions)});
+                            if (s.damage.size() > kMaxDamageQueued)
+                                s.damage.erase(s.damage.begin());
+                        }
                         for (uint32_t i = 0; i < regions.Size(); ++i) {
                             const auto g = regions.GetAt(i);
                             const RECT local{g.X - s.srcRect.left, g.Y - s.srcRect.top,
@@ -996,6 +1031,186 @@ void Capture::Stop() {
     s.filled = 0;
     s.olderTime100ns = s.prevTime100ns = s.newestTime100ns = 0.0;
     s.started = false;
+    s.itemClosed->store(false, std::memory_order_release);
+}
+
+// ------------------------------------------------------------------ DamageScout
+
+struct DamageScout::Impl {
+    HWND target = nullptr;
+    winrt::com_ptr<ID3D11Device> device;
+    wgdx::Direct3D11::IDirect3DDevice rtDevice{nullptr};
+    wgc::GraphicsCaptureItem item{nullptr};
+    wgc::Direct3D11CaptureFramePool pool{nullptr};
+    wgc::GraphicsCaptureSession session{nullptr};
+    winrt::event_token closedToken{};
+    std::shared_ptr<std::atomic<bool>> itemClosed = std::make_shared<std::atomic<bool>>(false);
+    LONG surfW = 0, surfH = 0;
+    bool broken = false;
+};
+
+DamageScout::DamageScout() : impl_(std::make_unique<Impl>()) {}
+DamageScout::~DamageScout() { Stop(); }
+HWND DamageScout::Target() const { return impl_->target; }
+LONG DamageScout::SurfaceW() const { return impl_->surfW; }
+LONG DamageScout::SurfaceH() const { return impl_->surfH; }
+
+bool DamageScout::Start(HWND target, std::string* err) {
+    Stop();
+    Impl& s = *impl_;
+    auto fail = [&](const std::string& m) {
+        if (err) *err = m;
+        Stop();
+        return false;
+    };
+    if (!target || !IsWindow(target)) return fail("target is not a window");
+    try {
+        if (!wgc::GraphicsCaptureSession::IsSupported()) return fail("WGC unsupported");
+    } catch (winrt::hresult_error const& e) {
+        return fail(Fmt("IsSupported threw %s", HrString(e.code()).c_str()));
+    }
+    // Its own device: the scout runs while nothing is engaged, so there is no overlay
+    // device to borrow, and it must not make one.
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+                                   s.device.put(), nullptr, nullptr);
+    if (FAILED(hr)) return fail(Fmt("D3D11CreateDevice %s", HrString(hr).c_str()));
+    {
+        winrt::com_ptr<IDXGIDevice> dxgi;
+        hr = s.device->QueryInterface(IID_PPV_ARGS(dxgi.put()));
+        if (FAILED(hr)) return fail(Fmt("QI IDXGIDevice %s", HrString(hr).c_str()));
+        winrt::com_ptr<::IInspectable> insp;
+        hr = CreateDirect3D11DeviceFromDXGIDevice(dxgi.get(), insp.put());
+        if (FAILED(hr) || !insp) return fail(Fmt("CreateDirect3D11DeviceFromDXGIDevice %s", HrString(hr).c_str()));
+        try {
+            s.rtDevice = insp.as<wgdx::Direct3D11::IDirect3DDevice>();
+        } catch (winrt::hresult_error const& e) {
+            return fail(Fmt("IDirect3DDevice %s", HrString(e.code()).c_str()));
+        }
+    }
+    {
+        winrt::hresult_error factoryError{};
+        auto interop = winrt::try_get_activation_factory<wgc::GraphicsCaptureItem,
+                                                         ::IGraphicsCaptureItemInterop>(factoryError);
+        if (!interop) return fail("IGraphicsCaptureItemInterop unavailable");
+        hr = interop->CreateForWindow(target, winrt::guid_of<wgc::GraphicsCaptureItem>(),
+                                      winrt::put_abi(s.item));
+        if (FAILED(hr) || !s.item) return fail(Fmt("CreateForWindow %s", HrString(hr).c_str()));
+    }
+    winrt::Windows::Graphics::SizeInt32 size{};
+    try {
+        size = s.item.Size();
+        s.pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
+            s.rtDevice, wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+        s.session = s.pool.CreateCaptureSession(s.item);
+    } catch (winrt::hresult_error const& e) {
+        return fail(Fmt("pool/session %s", HrString(e.code()).c_str()));
+    }
+    if (size.Width <= 0 || size.Height <= 0) return fail("degenerate item size");
+    s.surfW = size.Width;
+    s.surfH = size.Height;
+    // The yellow capture border around the user's browser would BE the mechanism showing
+    // (D22): no border, or no scout. The access was granted once for the real capture
+    // already (G14); asking again is answered from the cache.
+    try {
+        auto status = wacc::AppCapabilityAccessStatus::DeniedBySystem;
+        auto op = wgc::GraphicsCaptureAccess::RequestAccessAsync(wgc::GraphicsCaptureAccessKind::Borderless);
+        AwaitOperation(op, kAccessRequestTimeoutMs, &status);
+        s.session.IsBorderRequired(false);
+        if (s.session.IsBorderRequired()) return fail("the capture border cannot be turned off");
+    } catch (winrt::hresult_error const& e) {
+        return fail(Fmt("borderless %s", HrString(e.code()).c_str()));
+    }
+    try {
+        s.session.IsCursorCaptureEnabled(false);
+        s.session.DirtyRegionMode(wgc::GraphicsCaptureDirtyRegionMode::ReportOnly);
+    } catch (winrt::hresult_error const& e) {
+        return fail(Fmt("dirty regions unavailable %s", HrString(e.code()).c_str()));
+    }
+    try {
+        s.session.MinUpdateInterval(std::chrono::duration_cast<wf::TimeSpan>(
+            std::chrono::duration<double, std::milli>(1.0)));  // G4
+    } catch (winrt::hresult_error const&) {
+    }
+    try {
+        auto flag = s.itemClosed;
+        s.closedToken = s.item.Closed([flag](wgc::GraphicsCaptureItem const&, wf::IInspectable const&) {
+            flag->store(true, std::memory_order_release);
+        });
+        s.session.StartCapture();
+    } catch (winrt::hresult_error const& e) {
+        return fail(Fmt("StartCapture %s", HrString(e.code()).c_str()));
+    }
+    s.target = target;
+    s.broken = false;
+    return true;
+}
+
+bool DamageScout::Poll(std::vector<TimedDamage>* out) {
+    Impl& s = *impl_;
+    if (!s.session || s.broken) return false;
+    if (s.itemClosed->load(std::memory_order_acquire)) {
+        s.broken = true;
+        return false;
+    }
+    for (;;) {
+        wgc::Direct3D11CaptureFrame frame{nullptr};
+        try {
+            frame = s.pool.TryGetNextFrame();
+        } catch (winrt::hresult_error const&) {
+            s.broken = true;
+            return false;
+        }
+        if (!frame) break;
+        try {
+            const auto content = frame.ContentSize();
+            if (content.Width != s.surfW || content.Height != s.surfH) {
+                s.broken = true;  // resized: the coordinates no longer mean anything
+                frame.Close();
+                return false;
+            }
+            auto f2 = frame.try_as<wgc::IDirect3D11CaptureFrame2>();
+            if (f2 && out) {
+                const double t = static_cast<double>(frame.SystemRelativeTime().count()) / 1e7;
+                out->push_back(TimedDamage{t, DamageFromRegions(f2.DirtyRegions())});
+            }
+            frame.Close();
+        } catch (winrt::hresult_error const&) {
+            s.broken = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+void DamageScout::Stop() {
+    Impl& s = *impl_;
+    if (s.item && s.closedToken) {
+        try {
+            s.item.Closed(s.closedToken);
+        } catch (...) {
+        }
+        s.closedToken = {};
+    }
+    if (s.session) {
+        try {
+            s.session.Close();
+        } catch (...) {
+        }
+        s.session = nullptr;
+    }
+    if (s.pool) {
+        try {
+            s.pool.Close();
+        } catch (...) {
+        }
+        s.pool = nullptr;
+    }
+    s.item = nullptr;
+    s.rtDevice = nullptr;
+    s.device = nullptr;
+    s.target = nullptr;
+    s.surfW = s.surfH = 0;
     s.itemClosed->store(false, std::memory_order_release);
 }
 

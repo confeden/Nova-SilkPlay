@@ -27,8 +27,10 @@ late. Fullscreen means what Chrome does for `F` on a video or for `F11` — the
 window rect is its monitor's, with no caption, no sizing frame and not maximised
 (a maximised window with an auto-hidden taskbar also covers the monitor, so the
 frame bits are checked too). Leaving fullscreen detaches on the same iteration.
-`--allow-windowed` restores attaching to a windowed browser, and `--rect` implies
-it. It filters on the process image (`chrome.exe`) as well as the window
+A video playing in a WINDOWED browser is found from outside since P11 (see
+"Video in a windowed browser" below); `--fullscreen-only` turns that off.
+`--allow-windowed` is the old lab switch that takes a windowed browser's whole client
+area for the video, and `--rect` implies it. It filters on the process image (`chrome.exe`) as well as the window
 class, because `Chrome_WidgetWin_1` is shared by every Electron and CEF app on
 the machine — the Claude desktop app answers to it here, and class alone would
 happily attach to that instead.
@@ -107,6 +109,58 @@ restores the strict rule; `--occlusion-ignore quotty.exe,other.exe` exempts name
 processes whatever their size (spaces, paths and a missing `.exe` are tolerated;
 the list is logged at startup). Only one engine runs per session:
 two would take turns stealing the slot above the browser.
+
+## Video in a windowed browser (P11)
+
+There is no page channel (D30), and UI Automation does not reach Chrome's web content
+from outside: the tree stops at the render widget (`tools/window-probe/uia_video.cpp`,
+measured 2026-10-06). What does see the video is DWM: every capture of the browser
+window carries the rects that changed, and a playing `<video>` damages exactly its own
+rect, frame after frame. Measured on windowed YouTube on the 1080p secondary
+(`tools/yt-check/windowed_probe.py`): the default layout's video arrives as
+`[18,171 1087x455]` 17-19 times a second, a scrolled one as its visible part, theater
+mode as its own rect plus a four-rect ring, the dark theme's ambient glow as a bigger
+rect around it ~12 times a second, a scroll as the whole page once.
+
+* **Scouting** (`DamageScout`, `nsp_capture.*`) runs only while nothing is engaged,
+  the browser is windowed and Windows' media session list says Chrome is playing
+  (`MediaWatch`, `nsp_mediawatch.*`; `--scout-always` drops that condition for the lab).
+  It copies nothing: a borderless, cursorless WGC session on its own small device,
+  reading dirty regions only. A fullscreen browser anywhere wins: scouting never runs
+  beside one, and the target search tries fullscreen first. Cost is bounded: after 20 s
+  without a find it looks 5 s in every 20 (background music keeps the media session
+  "playing" for hours), and a new page in the window starts it over.
+* **Finding** (`RectFinder`, `nsp_rectfind.*`): the video is the largest rect that is
+  a capture's WHOLE damage at least 8 times in the last second, in both halves of it,
+  still arriving (last hit within 0.25 s), for at least half a second, at least
+  256x144, aspect 0.3-8; decided ten times a second. Never the whole window, never the page area
+  (Chrome's render widget), never a rect cut off by two perpendicular viewport edges
+  (a clipped glow). A frequent rect containing another frequent one is a surround,
+  and the inner one wins at half the hits. Other shapes that keep repeating beside it
+  and touch it become companions.
+* **Guarding** (`GeometryGuard`): every capture of the engaged session is the video
+  rect (confirms), inside it (player UI), elsewhere on the page (hover, comments - a
+  video that moves repaints where it was, so damage that misses it cannot mean it
+  moved), a companion, or foreign. It starts unconfirmed: nothing watched the page
+  while the engage ran. A foreign capture covering 95 % of the page area (a scroll)
+  hides the overlay on that capture; a smaller one is forgiven if
+  the video rect follows within 100 ms and learned after two; otherwise it hides.
+  The overlay returns after three captures of the video rect and 100 ms quiet. Still
+  hidden 0.6 s later under foreign damage: disengage and scout again. Engagements that
+  never showed a picture back off 1, 2, 4 ... 30 s, so a page whose damage keeps breaking
+  the rect cannot rebuild the pipeline once a second.
+* **Input first**: a wheel notch over the browser's window rect (raw input, so nothing
+  waits for us; no `WindowFromPoint`, which can send to a hung window from the thread
+  that also carries the keyboard hook) or a scrolling key while it has the focus hides
+  the overlay before the scroll is drawn.
+
+`tools/yt-check/windowed_check.py` runs the whole sequence - find, scroll, theater,
+pause/play, fullscreen and back - and compares the engine's rect with the page's own
+(`--local` uses `windowed_page.html`, a canvas-fed `<video>` with a sticky header and an
+optional glow, no network). On YouTube (light theme) and on the local page the rect
+matched the page's to 1-2 px (the damage rect is the element rounded out), scrolls hid
+the overlay in 0.1 s and the video was found again in about 2 s. `tests/rectfind_test.cpp`
+replays the measured shapes (18 checks of behaviour).
 
 ## Which captures are video frames
 
@@ -542,8 +596,15 @@ sources, not an average of them.
 * **A bigger window left permanently over the video pauses generation
   permanently** — widgets are exempt, anything larger than a tenth of the picture
   is not. `--occlusion-ignore` is the escape hatch.
-* **Windowed video is not generated at all** without `--allow-windowed` or
-  `--rect`, by the owner's choice, until P11 reads the video rect from the page.
+* **Windowed video is refused, not guessed, in three measured cases** (P11): a
+  video whose surround repaints in the same frame as the picture every time (the
+  ambient glow on some pages: only their union ever arrives, and it is clipped at
+  the viewport's corner), a video with a page animation constantly unioned into
+  its damage, and a video half scrolled out of a viewport it also fills edge to
+  edge. Each plays natively, unsmoothed.
+* **After a scroll or a layout change the windowed video plays unsmoothed for
+  about two seconds** while it is found again (hide 0.1 s, give up 0.6 s, find
+  0.8 s, engage 0.3 s); the overlay is torn down and rebuilt rather than moved.
 * Moving or resizing the target window tears everything down and re-engages
   (the overlay HWND is frozen by I11).
 
@@ -553,7 +614,10 @@ sources, not an average of them.
 |---|---|
 | `main.cpp` | CLI, engage/disengage, the cadence estimator, the pacing timeline, the phase, the loop |
 | `nsp_overlay.*` | the D3D11 device, the overlay HWND, DComp, the composition swapchain |
-| `nsp_capture.*` | WGC → a five-slot GPU ring of video-rect crops (older, previous, reference, newest, pending), and the test that tells a video frame from a UI-only recomposition |
+| `nsp_capture.*` | WGC → a five-slot GPU ring of video-rect crops (older, previous, reference, newest, pending), and the test that tells a video frame from a UI-only recomposition; every capture's dirty regions for the geometry guard; `DamageScout`, the copy-nothing session that looks for a windowed video |
+| `nsp_rectfind.*` | P11: `RectFinder` (which damage rect is the video) and `GeometryGuard` (may the overlay show on it now) - pure logic |
+| `nsp_mediawatch.*` | is a Chrome media session Playing, from Windows' media transport controls, on its own thread |
+| `tests/rectfind_test.cpp` | the finder and the guard on the damage shapes measured on windowed YouTube (`tests\build_rectfind_test.cmd`) |
 | `nsp_winwatch.*` | WinEvent hooks that re-run the occlusion test the moment windows change |
 | `nsp_tray.*` | the UI thread: the tray icon, its menu, and the mailbox between it and the engine |
 | `nsp_settings_window.*` | the Settings window (cards, owner-drawn switches, DPI changes, keyboard) |

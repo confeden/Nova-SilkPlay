@@ -13,13 +13,22 @@
 #pragma once
 
 #include "nsp_common.h"
+#include "nsp_rectfind.h"
 
 #include <d3d11_1.h>
 
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace nsp {
+
+// One capture's damage as DWM reported it, in WGC surface coordinates, stamped with the
+// capture's SystemRelativeTime in seconds (the QPC clock, as QpcToSec).
+struct TimedDamage {
+    double tSec = 0.0;
+    DamageSig d;
+};
 
 struct CaptureOptions {
     double minUpdateIntervalMs = 1.0;  // G4
@@ -92,6 +101,39 @@ public:
     bool NeedsReengage() const;
 
     const std::string& StartupReport() const;
+
+    // Every capture's damage since the last call, oldest first (P11: the geometry guard of a
+    // windowed video). Empty on a build without dirty regions. Capped: a caller that stops
+    // draining loses the oldest, never blocks the capture.
+    void TakeDamage(std::vector<TimedDamage>* out);
+    // Off by default: the fullscreen path never reads it, and an undrained queue would cost a
+    // shift of 256 entries per capture.
+    void EnableDamage(bool on);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// SCOUTING a windowed browser for its video (P11): a capture session that copies nothing
+// and reads only where DWM says the window changed. Its own small device, so it costs no
+// overlay, no synthesis and no ring - only what WGC itself does per frame. Borderless and
+// cursorless like the real capture: scouting must not show either (D22, I12).
+class DamageScout {
+public:
+    DamageScout();
+    ~DamageScout();
+    DamageScout(const DamageScout&) = delete;
+    DamageScout& operator=(const DamageScout&) = delete;
+
+    bool Start(HWND target, std::string* err);
+    void Stop();
+    // Drains the frames that arrived: their damage, nothing else. false once the window
+    // closed or resized (the session is then useless; Stop and start again).
+    bool Poll(std::vector<TimedDamage>* out);
+    HWND Target() const;
+    LONG SurfaceW() const;
+    LONG SurfaceH() const;
 
 private:
     struct Impl;

@@ -311,6 +311,12 @@ def main():
                     help="output directory")
     ap.add_argument("--no-page", action="store_true",
                     help="do not launch Chrome; assume window exists")
+    ap.add_argument("--target-title", default="Nova SilkPlay motion source",
+                    help="window title substring the engine targets")
+    ap.add_argument("--windowed-auto", action="store_true",
+                    help="the P11 windowed path (rect found from DWM damage, --scout-always) "
+                         "instead of --allow-windowed's whole client; pair with "
+                         "tools/yt-check/windowed_soak_page.py and --no-page")
     ap.add_argument("--engine-arg", action="append", default=[],
                     help="extra engine arguments (repeatable)")
     args = ap.parse_args()
@@ -360,7 +366,7 @@ def main():
             return 1
         print(f"Test page ready: hwnd=0x{hwnd:X}")
     else:
-        hwnd = find_window("Nova SilkPlay motion source")
+        hwnd = find_window(args.target_title)
         if not hwnd:
             print("Could not find test page window", file=sys.stderr)
             return 1
@@ -370,9 +376,8 @@ def main():
     print("Launching engine...")
     cmd = [
         os.path.join(PROTO, "silkplay.exe"),
-        "--target-title", "Nova SilkPlay motion source",
-        "--allow-windowed",
-    ]
+        "--target-title", args.target_title,
+    ] + (["--scout-always"] if args.windowed_auto else ["--allow-windowed"])
     cmd.extend(args.engine_arg)
 
     with open(log_path, "w", encoding="utf-8", buffering=1) as log_f:
@@ -518,7 +523,7 @@ def main():
     proc.wait()
 
     # Phase 5: close test page window
-    hwnd = find_window("Nova SilkPlay motion source")
+    hwnd = find_window(args.target_title)
     if hwnd:
         user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
         time.sleep(1)

@@ -183,7 +183,7 @@ def open_fullscreen(a, W, H, X=0, Y=0):
     stale = os.path.join(a.profile, "DevToolsActivePort")
     if os.path.exists(stale):
         os.remove(stale)
-    extra = ["--mute-audio", "--window-position=120,120", "--window-size=1600,900"]
+    extra = ["--mute-audio", f"--window-position={X + 80},{Y + 60}", "--window-size=1600,900"]
     if a.proxy:
         extra.append(f"--proxy-server={a.proxy}")
     kill_profile_chrome(a.profile, wait_s=0.0)
