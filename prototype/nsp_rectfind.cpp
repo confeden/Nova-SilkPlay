@@ -137,15 +137,24 @@ bool RectFinder::Found(double tSec, RECT* video, std::vector<DamageSig>* compani
     };
     std::map<RectKey, Hit> hits;
     for (const auto& e : hist_) {
-        if (e.d.overflow || e.d.n != 1) continue;
-        auto& h = hits[Key(e.d.r[0])];
-        if (h.recent == 0 && h.first == 0.0) {
-            h.first = e.t;
-            h.r = e.d.r[0];
+        if (e.d.overflow) continue;
+        // A rect counts when it is a capture's damage ON ITS OWN: alone, or beside rects that
+        // do not touch it (a tab strip repaint in the same frame does not make the picture any
+        // less the picture). A rect overlapping another is part of a union and counts for none.
+        for (int i = 0; i < e.d.n; ++i) {
+            bool apart = true;
+            for (int j = 0; j < e.d.n; ++j)
+                apart = apart && (j == i || !Touches(e.d.r[i], e.d.r[j], 0));
+            if (!apart) continue;
+            auto& h = hits[Key(e.d.r[i])];
+            if (h.recent == 0 && h.first == 0.0) {
+                h.first = e.t;
+                h.r = e.d.r[i];
+            }
+            if (e.t >= tSec - cfg_.windowSec) ++h.recent;
+            if (e.t >= tSec - cfg_.windowSec * 0.5) ++h.lastHalf;
+            h.last = (std::max)(h.last, e.t);
         }
-        if (e.t >= tSec - cfg_.windowSec) ++h.recent;
-        if (e.t >= tSec - cfg_.windowSec * 0.5) ++h.lastHalf;
-        h.last = (std::max)(h.last, e.t);
     }
     std::vector<const Hit*> cands;
     for (const auto& kv : hits) {
@@ -260,15 +269,23 @@ GeomVerdict GeometryGuard::Add(double tSec, const DamageSig& d) {
     if (d.n <= 0 && !d.overflow) return GeomVerdict::kInside;  // no damage: nothing moved
     lastCapture_ = tSec;
     GeomVerdict v = GeomVerdict::kForeign;
+    DamageSig rel;  // only the rects that reach the video
     if (!d.overflow) {
-        bool inside = true, touches = false;
+        // PER RECT. Chrome hands a frame's damage over as a few rects, and a rect nowhere
+        // near the video says nothing about it: on the owner's Chrome a 358x40 repaint in the
+        // tab strip (the title's unread count) arrived in the same frame as the picture every
+        // few seconds, and judged as one shape it hid the overlay each time (2026-10-07).
+        bool inside = true, exact = false;
         for (int k = 0; k < d.n; ++k) {
+            if (!Touches(d.r[k], video_, cfg_.exactTolPx)) continue;
+            rel.r[rel.n++] = d.r[k];
             inside = inside && Inside(d.r[k], video_, cfg_.exactTolPx);
-            touches = touches || Touches(d.r[k], video_, cfg_.exactTolPx);
+            exact = exact || Near(d.r[k], video_, cfg_.exactTolPx);
         }
-        if (d.n == 1 && Near(d.r[0], video_, cfg_.exactTolPx)) {
+        const bool touches = rel.n > 0;
+        if (touches && inside && exact) {
             v = GeomVerdict::kExact;
-        } else if (inside) {
+        } else if (touches && inside) {
             v = GeomVerdict::kInside;
         } else if (!touches) {
             // Damage that does not reach the video cannot mean the video moved: anything that
@@ -277,11 +294,11 @@ GeomVerdict GeometryGuard::Add(double tSec, const DamageSig& d) {
             v = GeomVerdict::kElsewhere;
         } else {
             for (const auto& c : companions_)
-                if (c.Same(d)) v = GeomVerdict::kCompanion;
+                if (c.Same(d) || c.Same(rel)) v = GeomVerdict::kCompanion;
         }
     }
     if (v == GeomVerdict::kForeign && !d.overflow) {
-        const RECT b = d.Bounds();
+        const RECT b = rel.Bounds();
         const double area = static_cast<double>(W(b)) * H(b);
         const LONG vw = W(viewport_), vh = H(viewport_);
         // Against the PAGE area when it is known: a scroll repaints all of it, and the share of

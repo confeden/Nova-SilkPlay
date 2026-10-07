@@ -114,7 +114,7 @@ struct TargetWindow {
 };
 
 // A browser in fullscreen: the window rect IS its monitor's rect, it has neither a
-// caption nor a sizing frame, and it is not maximised. MEASURED on Chrome
+// caption nor a sizing frame (WS_MAXIMIZE may remain: G75). MEASURED on Chrome
 // (2026-09-13): fullscreen style 160B0000 with window == monitor; maximised
 // 17CF0000 with the window 8 px past every edge and the client on the WORK area;
 // windowed 16CF0000. A maximised window with an auto-hidden taskbar can cover the

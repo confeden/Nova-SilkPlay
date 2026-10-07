@@ -316,6 +316,21 @@ static void TestViewportImmediate() {
     CHECK(g.Add(0.5, Sig({vp})) == GeomVerdict::kForeign);
 }
 
+static void TestTabStripBeside() {
+    printf("test21_tab_strip_repaint_beside_the_picture\n");
+    const DamageSig both = Sig({R(1842, 50, 358, 40), kVideo});
+    GeometryGuard g;
+    g.Begin(0.0, kVideo, {}, kSW, kSH);
+    CHECK(g.Add(0.1, both) == GeomVerdict::kExact);
+    RectFinder f;
+    f.Reset(kSW, kSH);
+    int i = 0;
+    for (double t = 0; t < 1.6; t += 1.0 / 24.0, ++i) f.Add(t, (i % 2) ? both : Sig({kVideo}));
+    RECT v{};
+    CHECK(f.Found(1.6, &v, nullptr));
+    CHECK(Eq(v, kVideo));
+}
+
 static void TestOverflow() {
     printf("test11_overflow_is_foreign\n");
     GeometryGuard g;
@@ -339,6 +354,7 @@ int main() {
     TestGuardNoExact();
     TestGuardIdle();
     TestOverflow();
+    TestTabStripBeside();
     TestBurstIsNotAVideo();
     TestViewportImmediate();
     TestCornerClippedUnion();

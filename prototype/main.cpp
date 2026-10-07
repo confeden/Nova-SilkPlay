@@ -1598,8 +1598,9 @@ void App::Scout(int64_t now) {
             scoutStartQpc_ = now;
             finder_.Reset(scout_->SurfaceW(), scout_->SurfaceH(), vp);
             scoutViewport_ = vp;
-            Log("windowed video: looking for the video in 0x%p \"%s\" (media %s)",
-                static_cast<void*>(t.hwnd), Narrow(t.title).c_str(), MediaStateName(media_.State()));
+            Log("windowed video: looking for the video in 0x%p \"%s\" (media %s, page area %s)",
+                static_cast<void*>(t.hwnd), Narrow(t.title).c_str(), MediaStateName(media_.State()),
+                RectStr(vp).c_str());
         } else if (memcmp(&vp, &scoutViewport_, sizeof(RECT)) != 0) {
             finder_.Reset(scout_->SurfaceW(), scout_->SurfaceH(), vp);  // the page area moved
             scoutViewport_ = vp;

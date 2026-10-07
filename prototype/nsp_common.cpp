@@ -368,7 +368,11 @@ bool IsCloaked(HWND hwnd) {
 // ------------------------------------------------------------- target window
 
 bool IsFullscreenWindow(HWND hwnd) {
-    if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd)) return false;
+    // NOT IsZoomed: Chrome entering fullscreen from a MAXIMISED window keeps WS_MAXIMIZE -
+    // measured 2026-10-07 on the owner's Chrome, style 170B0000, rect == the monitor, no
+    // caption, no frame - and refusing it sent fullscreen video down the windowed path. A
+    // maximised window over an auto-hidden taskbar is still refused below: it has both bits.
+    if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd)) return false;
     const LONG style = GetWindowLongW(hwnd, GWL_STYLE);
     if ((style & WS_CAPTION) == WS_CAPTION || (style & WS_THICKFRAME) != 0) return false;
     RECT wr{};

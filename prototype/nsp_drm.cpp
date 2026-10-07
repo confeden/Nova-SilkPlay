@@ -366,6 +366,13 @@ CdmKind ClassifyCommandLine(const std::wstring& cmd, std::wstring* subtypeOut) {
     // This one is tested against the WHOLE command line on purpose: it is a file name
     // (widevinecdm.dll), not a subtype, and it appears alongside one.
     if (low.find(L"widevinecdm") != std::wstring::npos) return CdmKind::kLibrary;
+    // Benign utilities that DO live under media.mojom. Exact subtypes only, each one seen on a
+    // real machine: SpeechRecognitionService is Chrome's Live Caption / on-device speech, and
+    // on the owner's Chrome it is resident - before this entry it held the gate at UNKNOWN and
+    // generation never showed at all (2026-10-07).
+    static const wchar_t* const kBenignMedia[] = {L"media.mojom.speechrecognitionservice"};
+    for (const wchar_t* b : kBenignMedia)
+        if (hay == b) return CdmKind::kNone;
     if (hay.find(L"media.mojom.") != std::wstring::npos) return CdmKind::kUnrecognisedMedia;
     return CdmKind::kNone;
 }
