@@ -2,42 +2,51 @@
   <img src="assets/logo.png" width="48" height="48" alt="" valign="middle"> Nova SilkPlay
 </h1>
 
-<p align="center">Smoother video in Google Chrome, powered by GPU frame generation.</p>
+<p align="center">Плавное видео в Google Chrome благодаря генерации кадров на видеокарте.</p>
 <p align="center">
-  <a href="https://github.com/confeden/Nova-SilkPlay/releases"><strong>Download for Windows</strong></a>
-  · <a href="https://github.com/confeden/Nova-SilkPlay/issues">Report an issue</a>
+  <a href="https://github.com/confeden/Nova-SilkPlay/releases"><strong>Скачать для Windows</strong></a>
+  · <a href="https://t.me/nova_txt/36831">Поддержка</a>
   · <a href="LICENSE">GPL-3.0</a>
 </p>
 
-Nova SilkPlay adds intermediate frames to video playing in Chrome and automatically targets your monitor's refresh rate. It runs in the notification area, supports fullscreen and windowed video, and needs no browser extension.
+Nova SilkPlay добавляет промежуточные кадры в видео, которое воспроизводится в Chrome, и автоматически подстраивается под частоту обновления монитора. Программа работает в трее, поддерживает видео в окне и во весь экран. Расширение для браузера не нужно.
 
-## Requirements
+## Требования
 
-- Windows 10 2004 or newer / Windows 11, 64-bit.
-- Google Chrome and an NVIDIA GPU with hardware Optical Flow support. Tested on RTX 5060 Ti; other GPUs are unverified.
+- Windows 10 версии 2004 или новее / Windows 11, 64 бита.
+- Google Chrome и видеокарта NVIDIA с аппаратной поддержкой Optical Flow. Проверено на RTX 5060 Ti; другие видеокарты пока не проверены.
 
-## Quick start
+## Как пользоваться
 
-1. Open [Releases](https://github.com/confeden/Nova-SilkPlay/releases) and download `Nova.SilkPlay-0.9.0-setup.exe`.
-2. Run the installer, then launch **Nova SilkPlay** from the Start menu.
-3. Play a video in Chrome with sound enabled. Keep the video visible; fullscreen is the easiest way to start. Frame generation starts automatically when a suitable video is detected.
-4. Click the **pink ribbon** in the notification area (check the **^** menu if hidden) to open Settings. Enable **Google Chrome** and, if desired, **Frame rate counter** or **Start with Windows**. Settings are saved automatically.
+1. Откройте [релизы](https://github.com/confeden/Nova-SilkPlay/releases) и скачайте `Nova.SilkPlay-0.9.0-setup.exe`.
+2. Установите программу и запустите **Nova SilkPlay** через меню «Пуск».
+3. Включите видео со звуком в Chrome. Для первого запуска удобнее развернуть его на весь экран. Генерация кадров начнётся автоматически, когда программа обнаружит подходящее видео.
+4. Нажмите на **розовую ленту** в трее возле часов, чтобы открыть настройки. Если значок скрыт, нажмите **^**. Включите **Google Chrome**, а при желании — **Счётчик кадров** и **Запускать вместе с Windows**. Настройки сохраняются автоматически.
 
-| Shortcut | Action |
+| Сочетание клавиш | Действие |
 | --- | --- |
-| `Ctrl+Alt+Q` | Turn frame generation on or off |
-| `Ctrl+Alt+X` | Quit Nova SilkPlay |
+| `Ctrl+Alt+Q` | Включить или выключить генерацию кадров |
+| `Ctrl+Alt+X` | Закрыть Nova SilkPlay |
 
-You can also right-click the tray icon to toggle generation or quit. To update, run the newer installer; to remove the app, use Windows **Settings → Apps**.
+Включить генерацию или закрыть программу можно и через правую кнопку мыши по значку в трее. Для обновления запустите новый установщик. Для удаления откройте **Параметры Windows → Приложения**.
 
-## If video is not smoother
+## Если видео не стало плавнее
 
-Check that Chrome is enabled in Settings and generation is on. Start playback with sound, uncover the video, or try fullscreen. Hover over the tray icon to see the current status. Generation pauses when a window covers the video or a game is detected.
+Проверьте, что Chrome выбран в настройках, а генерация кадров включена. Запустите видео со звуком, уберите перекрывающие его окна или попробуйте полноэкранный режим. Наведите указатель на значок в трее — подсказка покажет текущий статус. При перекрытии видео другим окном или обнаружении игры генерация приостанавливается.
 
-Version **0.9.0** supports **Chrome only**; PotPlayer is planned. DRM-protected video is unsupported. Some scenes may show interpolation artifacts, and sustained 165 Hz smoothness is still being validated.
+Версия **0.9.0** поддерживает **только Chrome**; поддержка PotPlayer запланирована. Видео с DRM-защитой не поддерживается. В отдельных сценах возможны артефакты генерации кадров; стабильная плавность на 165 Гц ещё проверяется.
 
-The installer uses the author's self-signed certificate with an online timestamp. Windows may still show a publisher or SmartScreen warning.
+Установщик подписан самоподписанным сертификатом автора с онлайн-меткой времени. Windows и SmartScreen всё ещё могут показывать предупреждение.
 
-## License
+## Лицензия
 
-[GPL-3.0-only](LICENSE). See [third-party notices](THIRD_PARTY_NOTICES.md) and [developer documentation](prototype/README.md).
+[GPL-3.0-only](LICENSE). См. [сведения о сторонних компонентах](THIRD_PARTY_NOTICES.md) и [документацию для разработчиков](prototype/README.md).
+
+---
+
+# Создано с ❤️
+
+🙋 **Группа в Телеграм:** [@nova_txt](https://t.me/nova_txt) — вопросы, новости, поддержка.
+
+☕ **[Отблагодарить](https://nova.gratis/donate)** — если SilkPlay оказалась полезной.
+Это необязательный способ сказать "спасибо".
