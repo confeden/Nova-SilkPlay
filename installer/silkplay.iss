@@ -1,12 +1,10 @@
-﻿; silkplay.iss - Nova SilkPlay beta installer. Per-user, no elevation (D6, D14).
+﻿; silkplay.iss - Nova SilkPlay installer. Per-user, no elevation (D6, D14).
 ;
 ; Build:  installer\build_installer.cmd
 ;    or:  "D:\Programs\Inno Setup 6\ISCC.exe" installer\silkplay.iss
 ;
-; SIGNING IS OFF and is a deliberate switch, not an oversight: pass /DSign=1 ONLY from a machine
-; the owner has confirmed clean. The dev PC has unresolved malware indicators (2026-09-17) and a
-; code-signing identity taken from a compromised machine is unrecoverable - it carries all the
-; SmartScreen reputation there is and cannot simply be rotated.
+; Signing is opt-in through build_installer.cmd sign, using the post-cleanup certificate
+; and a required online RFC3161 timestamp. Unsigned local builds remain available.
 ;
 ; Every version string comes out of the BUILT EXE, which rc.exe filled from prototype\nsp_version.h.
 ; That makes the header the single source: build.cmd additionally checks silkplay.manifest against
@@ -41,7 +39,7 @@ SolidCompression=yes
 WizardStyle=modern
 DisableProgramGroupPage=yes
 OutputDir=out
-OutputBaseFilename={#AppName}-{#AppVerText}-setup
+OutputBaseFilename=Nova.SilkPlay-{#AppVerText}-setup
 LicenseFile=LICENSE.txt
 SetupIconFile=..\prototype\res\silk.ico
 UninstallDisplayIcon={app}\silkplay.exe
@@ -73,6 +71,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
 [Files]
 Source: "..\prototype\silkplay.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 ; NOTHING ELSE, and the omissions are deliberate. The exe is self-contained: both shaders and
 ; both icons are already in its resources, so res\*.ico would only be duplicates. Explicitly NOT
 ; shipped: *.ppm and *.png measurement dumps, *.log, obj\, the Python harness (*.py, tests\),
@@ -80,21 +79,17 @@ Source: "LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\silkplay.exe"
+Name: "{userstartup}\{#AppName}"; Filename: "{app}\silkplay.exe"; WorkingDir: "{app}"; Tasks: autostart
 Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\silkplay.exe"; Tasks: desktopicon
 
 [Registry]
-; The autostart entry, and the ONLY place autostart is ever recorded. The Settings window's
-; "Start with Windows" switch reads and writes this same value; nothing about it is kept in
-; settings.json, so the two cannot disagree.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; \
-    ValueName: "{#AppName}"; ValueData: """{app}\silkplay.exe"""; \
-    Flags: uninsdeletevalue; Tasks: autostart
-; Not selected -> remove whatever a previous install left, so the wizard checkbox is the truth
-; after an upgrade too. InitializeWizard pre-ticks it from the registry, so "not selected" here
-; means the user actually cleared it.
+; Retire the old Run entry on upgrade; Settings and Setup both use the Startup shortcut.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; \
-    ValueName: "{#AppName}"; Flags: deletevalue uninsdeletevalue; Tasks: not autostart
+    ValueName: "{#AppName}"; Flags: deletevalue uninsdeletevalue
+
+[InstallDelete]
+Type: files; Name: "{userstartup}\{#AppName}.lnk"; Tasks: not autostart
 
 [Run]
 Filename: "{app}\silkplay.exe"; Description: "{cm:LaunchProgram,{#AppName}}"; \
@@ -102,6 +97,8 @@ Filename: "{app}\silkplay.exe"; Description: "{cm:LaunchProgram,{#AppName}}"; \
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{localappdata}\Nova SilkPlay\logs"
+; Settings can create this shortcut without the Setup task, and Inno removes only what it recorded.
+Type: files; Name: "{userstartup}\{#AppName}.lnk"
 ; settings.json and its directory are NOT listed on purpose: see CurUninstallStepChanged.
 
 [CustomMessages]
@@ -187,11 +184,21 @@ end;
 procedure InitializeWizard();
 var
   v: String;
+  approved: AnsiString;
+  registered: Boolean;
 begin
-  // Pre-tick "start with Windows" from what is REGISTERED, not from a fixed default. [Registry]
-  // re-runs on every upgrade, so without this a user who turned autostart off in Settings would
-  // get it switched back on by each update.
-  if RegQueryStringValue(HKEY_CURRENT_USER, RunKey, '{#AppName}', v) then
+  // Preserve the existing choice on upgrade, including legacy Run installations.
+  registered := FileExists(ExpandConstant('{userstartup}\{#AppName}.lnk'));
+  if not registered and RegQueryStringValue(HKEY_CURRENT_USER, RunKey, '{#AppName}', v) then
+  begin
+    registered := True;
+    if RegQueryBinaryValue(HKEY_CURRENT_USER,
+        'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run',
+        '{#AppName}', approved) then
+      if Length(approved) > 0 then
+        registered := (Ord(approved[1]) and 1) = 0;
+  end;
+  if registered then
     WizardSelectTasks('*autostart')
   else
     WizardSelectTasks('*!autostart');
@@ -218,6 +225,6 @@ end;
 procedure CurUninstallStepChanged(CurStep: TUninstallStep);
 begin
   if CurStep = usPostUninstall then
-    if MsgBox(ExpandConstant('{cm:AskRemoveSettings}'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+    if SuppressibleMsgBox(ExpandConstant('{cm:AskRemoveSettings}'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
       DelTree(ExpandConstant('{localappdata}\Nova SilkPlay'), True, True, True);
 end;

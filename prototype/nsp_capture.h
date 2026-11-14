@@ -46,9 +46,24 @@ struct CaptureStats {
     double   testWaitMsMax = 0;
 };
 
+// Engine-thread lifetime, shared by scouting and capture across re-engagements.
+// WGC broker allocations persist per CreateForWindow / access request on this OS.
+class CaptureRuntime {
+public:
+    CaptureRuntime();
+    ~CaptureRuntime();
+    CaptureRuntime(const CaptureRuntime&) = delete;
+    CaptureRuntime& operator=(const CaptureRuntime&) = delete;
+private:
+    friend class Capture;
+    friend class DamageScout;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 class Capture {
 public:
-    Capture();
+    explicit Capture(std::shared_ptr<CaptureRuntime> runtime = {});
     ~Capture();
     Capture(const Capture&) = delete;
     Capture& operator=(const Capture&) = delete;
@@ -121,7 +136,7 @@ private:
 // cursorless like the real capture: scouting must not show either (D22, I12).
 class DamageScout {
 public:
-    DamageScout();
+    explicit DamageScout(std::shared_ptr<CaptureRuntime> runtime = {});
     ~DamageScout();
     DamageScout(const DamageScout&) = delete;
     DamageScout& operator=(const DamageScout&) = delete;

@@ -434,6 +434,7 @@ def launch_chrome(
     user_data_dir: str | None = None,
     extra_args: list[str] | None = None,
     timeout: float = 30.0,
+    no_activate: bool = False,
 ) -> ChromeSession:
     """
     Launch Chrome with remote debugging and a throwaway profile.
@@ -474,7 +475,12 @@ def launch_chrome(
     ]
     if extra_args:
         args.extend(extra_args)
-    proc = subprocess.Popen(args)
+    startupinfo = None
+    if no_activate and os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 4  # SW_SHOWNOACTIVATE
+    proc = subprocess.Popen(args, startupinfo=startupinfo)
 
     deadline = time.monotonic() + timeout
     actual: tuple[int, str] | None = None

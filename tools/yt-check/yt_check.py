@@ -208,7 +208,10 @@ def summarize_dda(prefix):
     return {"frames": len(rows), "span_s": round(span, 3),
             "updates_per_s": round((len(rows) - 1) / span, 2),
             "distinct_pictures_per_s": round(changes / span, 2),
-            "recorder_missed": sum(max(0, a - 1) for a in acc),
+            # The measured span starts at the first acquired image. Its backlog
+            # predates that span; later accumulation loses images inside it.
+            "recorder_missed": sum(max(0, a - 1) for a in acc[1:]),
+            "recorder_startup_missed": max(0, acc[0] - 1),
             "interval_ms_median": round(statistics.median(gaps), 3),
             "interval_ms_p95": round(sorted(gaps)[int(0.95 * (len(gaps) - 1))], 3)}
 

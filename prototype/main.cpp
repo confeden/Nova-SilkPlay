@@ -16,6 +16,7 @@
 //     That is a known, accepted defect at prototype stage — see D23.
 
 #include "nsp_capture.h"
+#include "nsp_cadence.h"
 #include "nsp_mediawatch.h"
 #include "nsp_rectfind.h"
 #include "nsp_autostart.h"
@@ -108,7 +109,7 @@ struct AppOptions {
     // every interaction with that page would be shown a source period late.
     bool   allowWindowed = false;   // --allow-windowed
     bool   fullscreenOnly = false;  // --fullscreen-only: no windowed video (P11 off)
-    bool   scoutAlways = false;     // --scout-always: lab, look for a windowed video without a media session
+    bool   scoutAlways = false;     // --scout-always: lab, no media session needed to treat a picture as video
     bool   pauseForWidgets = false; // --pause-for-widgets: the strict occlusion rule
     bool   overlayLayered = true;   // --overlay-unlayered: measurement of LAYERED's cost only
     bool   logDirty = false;        // --log-dirty: per-capture video-frame test verdicts
@@ -530,21 +531,7 @@ public:
     // keeps the short-interval members of a beat pattern while still throwing
     // out a doubled interval (a repeated source frame) and a stall.
     double Period100ns() const {
-        if (count_ < 6) return 0.0;
-        double tmp[kN];
-        std::copy(intervals_, intervals_ + count_, tmp);
-        std::nth_element(tmp, tmp + count_ / 2, tmp + count_);
-        const double med = tmp[count_ / 2];
-        if (med <= 0.0) return 0.0;
-        double sum = 0.0;
-        size_t n = 0;
-        for (size_t i = 0; i < count_; ++i) {
-            if (intervals_[i] >= med * 0.4 && intervals_[i] <= med * 1.6) {
-                sum += intervals_[i];
-                ++n;
-            }
-        }
-        return n ? sum / static_cast<double>(n) : med;
+        return EstimateSourcePeriod100ns(intervals_, count_);
     }
 
     // Median capture delay. The error either way costs a clamped phase at one end
@@ -1010,6 +997,11 @@ public:
         : opt_(opt), settings_(settings), settingsPath_(settingsPath),
           settingsUnreadable_(settingsUnreadable) {
         if (!opt_.badgeFromCli) opt_.badge = settings_.showFpsCounter;
+        char* tracePath = nullptr;
+        traceInitFailed_ = _dupenv_s(&tracePath, nullptr, "NSP_PRESENT_TRACE") != 0;
+        if (tracePath) presentTracePath_ = tracePath;
+        std::free(tracePath);
+        if (!presentTracePath_.empty()) presentTrace_.reserve(60000);
     }
 
     int Run();
@@ -1019,6 +1011,13 @@ private:
     bool NeedFullscreen() const { return !opt_.allowWindowed && !opt_.haveRect; }
     // P11: a video in a WINDOWED browser is found from DWM's damage and generated in place.
     bool WindowedAuto() const { return NeedFullscreen() && !opt_.fullscreenOnly; }
+    // Whether a moving picture in the browser may be taken for a video at all. Without a page
+    // channel (D30) a playing media session is the only evidence: a WebGL game, a looping ad and
+    // a player stuck loading all pass the capture's video-frame test (I1, I10, G91).
+    bool MediaGateOpen(int64_t now) const {
+        return opt_.scoutAlways || now < manualScoutUntil_ || media_.State() != MediaState::kIdle;
+    }
+    void CheckMediaGate(int64_t now);
     void Scout(int64_t now);
     void StopScout();
     void GuardCapture();
@@ -1028,10 +1027,12 @@ private:
     void Tick();
     void LogStats();
     bool DoDump();
+    bool WritePresentTrace();
     // "<source fps>/<output fps>" for the readout.
     std::wstring FpsText() const;
     // A change made in the Settings window, applied between ticks.
     void ApplySettings(const Settings& s);
+    void ToggleGeneration(const char* source);
     // The tray icon's hover text: what the engine is doing right now, in the user's language.
     std::wstring TrayStatus() const;
 
@@ -1044,6 +1045,7 @@ private:
 
     std::unique_ptr<Overlay> overlay_;
     std::unique_ptr<Capture> capture_;
+    std::shared_ptr<CaptureRuntime> captureRuntime_ = std::make_shared<CaptureRuntime>();
     std::unique_ptr<Synth> synth_;
     Cadence cadence_;
     Timeline timeline_;
@@ -1099,6 +1101,9 @@ private:
     bool engageNow_ = false;         // skip the 1 s re-engage wait once
     bool guardWantsRescout_ = false; // the guard gave up: disengage from the main loop
     int64_t scoutSearchQpc_ = 0;     // when the current search began (the cost duty cycle)
+    int64_t manualScoutUntil_ = 0;   // explicit ON searches even without a media session
+    bool mediaProven_ = false;       // a browser reported Playing during this engagement
+    int64_t mediaIdleSinceQpc_ = 0;  // when this engagement last stopped being backed by one
     int64_t scoutDecideQpc_ = 0;     // last RectFinder::Found (10 Hz)
     RECT scoutViewport_{};           // the page area the finder was reset with
     RECT autoViewport_{};            // ... and the one the found rect came with
@@ -1134,6 +1139,28 @@ private:
     uint64_t badgeFrames_ = 0;
 
     uint64_t held_ = 0;  // ticks where the phase was clamped (source frame late)
+    struct PresentTraceRow {
+        int64_t qpc;
+        double a, b, phase, pollMs, motionMs;
+        uint64_t motionSerial;
+        int64_t motionDone;
+        int64_t previous, newest;
+        bool older, pair;
+        OverlayPresentTrace media;
+    };
+    std::string presentTracePath_;
+    std::vector<PresentTraceRow> presentTrace_;
+    struct MotionGpuTrace {
+        uint64_t serial = 0;
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+        Microsoft::WRL::ComPtr<ID3D11Query> disjoint, begin, end;
+    };
+    std::vector<MotionGpuTrace> motionGpuTrace_;
+    bool presentTraceFull_ = false;
+    bool traceInitFailed_ = false;
+    uint64_t traceMotionSerial_ = 0;
+    double traceMotionMs_ = 0.0;
+    int64_t traceMotionDone_ = 0;
     // Pacing quality, the number a viewer actually feels: between two presents the
     // displayed CONTENT time should advance by exactly the wall time that passed.
     // Any difference is judder, whatever caused it (a clamped phase, a wrong
@@ -1147,8 +1174,21 @@ private:
     uint64_t ticks_ = 0;        // main-loop iterations
     double msClock_ = 0, msWait_ = 0, msTick_ = 0;  // where a loop iteration goes
     uint64_t gateSkips_ = 0;    // ticks the rate gate rejected
-    double motionCpuMs_ = 0.0;  // CPU time submitting the estimate, not GPU time
-    uint64_t motionRuns_ = 0;
+    uint64_t gateResyncs_ = 0, gateIntervals_ = 0, gatePhaseSamples_ = 0;
+    int64_t gateLastTickQpc_ = 0;
+    double gateIntervalSumMs_ = 0.0, gateIntervalMinMs_ = 0.0, gateIntervalMaxMs_ = 0.0;
+    double gatePhaseAbsSumMs_ = 0.0, gatePhaseMinMs_ = 0.0, gatePhaseMaxMs_ = 0.0;
+    struct CpuStage {
+        double totalMs = 0.0, maxMs = 0.0;
+        uint64_t runs = 0;
+        void Add(int64_t start) {
+            const double ms = QpcToMs(QpcNow() - start);
+            totalMs += ms;
+            maxMs = (std::max)(maxMs, ms);
+            ++runs;
+        }
+    };
+    CpuStage captureCpu_, motionCpu_, acquireCpu_, drawCpu_, presentCpu_;
     uint64_t reengageFails_ = 0;
     // True when the last failed Engage() got past ResolveTarget and had already
     // started building the overlay, the synth and the capture. Waiting for a
@@ -1198,6 +1238,10 @@ bool App::ResolveTarget() {
                    Narrow(opt_.targetClass).c_str(), Narrow(opt_.targetExe).c_str(),
                    Narrow(opt_.targetTitle).c_str(), opt_.targetPid);
         }
+        return false;
+    }
+    if (t.fullscreen && !MediaGateOpen(QpcNow())) {
+        if (verbose) Log("browser is fullscreen but no media session is playing - not treated as video");
         return false;
     }
     if (WindowedAuto() && !t.fullscreen) {
@@ -1294,6 +1338,13 @@ bool App::Engage() {
     printf("%s", overlay_->CreationReport().c_str());
     fflush(stdout);
 
+    // The compositor already paces the fastest output. With only one queued
+    // frame, acquiring its buffer waits again and misses refreshes (G88).
+    if (!overlay_->SetFrameLatency(rateGate_ ? 1U : 2U)) {
+        LogErr("output frame-latency setup failed");
+        return false;
+    }
+
     synth_ = std::make_unique<Synth>();
     if (!synth_->Create(overlay_->Device(), overlay_->Context(), &err)) {
         LogErr("synth creation failed: %s", err.c_str());
@@ -1364,7 +1415,7 @@ bool App::Engage() {
     co.captureCursor = false;  // I12
     co.logDirty = opt_.logDirty;
     co.videoFrameTest = opt_.videoFrameTest;
-    capture_ = std::make_unique<Capture>();
+    capture_ = std::make_unique<Capture>(captureRuntime_);
     if (!capture_->Start(overlay_->Device(), overlay_->Context(), target_.hwnd, srcRect, co, &err)) {
         LogErr("capture start failed: %s", err.c_str());
         printf("%s", capture_->StartupReport().c_str());
@@ -1402,6 +1453,7 @@ bool App::Engage() {
 }
 
 void App::Disengage() {
+    const bool resetCaptureRuntime = faultDisengage_;
     // A FAULT THAT KILLS A FRESH ENGAGEMENT FEEDS THE BACKOFF. Rebuilding the
     // device, the overlay, the shaders and the capture session once a second for
     // ever is what a persistently invalid DComp device or a swapchain that will
@@ -1449,7 +1501,10 @@ void App::Disengage() {
     capture_.reset();
     synth_.reset();
     overlay_.reset();
+    if (engaged_) Log("pipeline disengaged");
     engaged_ = false;
+    // A device/DComp fault also needs fresh broker bindings, not a cached item.
+    if (resetCaptureRuntime) captureRuntime_ = std::make_shared<CaptureRuntime>();
 }
 
 // Called several times per compositor tick. A source frame is only noticed when
@@ -1458,7 +1513,9 @@ void App::Disengage() {
 // frames sitting on a clamped phase.
 void App::PollCapture() {
     if (!engaged_) return;
+    const int64_t pollStart = QpcNow();
     const int ingested = capture_->Poll();
+    captureCpu_.Add(pollStart);
     if (guardActive_) GuardCapture();
     if (ingested > 0) {
         const double now100 = Qpc100nsNow();
@@ -1481,6 +1538,24 @@ void App::PollCapture() {
         // Motion is estimated ONCE per source pair (I6). Everything the output
         // rate multiplies — the warp — is downstream of this call.
         if (opt_.mode == Mode::Mc && capture_->PreviousSrv() && synth_) {
+            MotionGpuTrace gpu;
+            if (!presentTracePath_.empty() && motionGpuTrace_.size() < 10000) {
+                gpu.serial = traceMotionSerial_ + 1;
+                gpu.context = overlay_->Context();
+                D3D11_QUERY_DESC desc{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+                HRESULT hr = overlay_->Device()->CreateQuery(&desc, &gpu.disjoint);
+                desc.Query = D3D11_QUERY_TIMESTAMP;
+                if (SUCCEEDED(hr)) hr = overlay_->Device()->CreateQuery(&desc, &gpu.begin);
+                if (SUCCEEDED(hr)) hr = overlay_->Device()->CreateQuery(&desc, &gpu.end);
+                if (FAILED(hr)) {
+                    LogErr("motion GPU trace query creation failed: %s", HrString(hr).c_str());
+                    traceInitFailed_ = true;
+                    gpu = {};
+                } else {
+                    gpu.context->Begin(gpu.disjoint.Get());
+                    gpu.context->End(gpu.begin.Get());
+                }
+            }
             const int64_t t0 = QpcNow();
             // The pair being replaced is the pacing's older pair: keep its field.
             if (ingested == 1 && capture_->OlderSrv()) {
@@ -1489,13 +1564,62 @@ void App::PollCapture() {
                 synth_->DropHeldFields();
             }
             synth_->PrepareMotion(capture_->PreviousSrv(), capture_->NewestSrv());
-            motionCpuMs_ += QpcToMs(QpcNow() - t0);
-            ++motionRuns_;
+            if (gpu.context) {
+                gpu.context->End(gpu.end.Get());
+                gpu.context->End(gpu.disjoint.Get());
+                motionGpuTrace_.push_back(std::move(gpu));
+            }
+            motionCpu_.Add(t0);
+            if (!presentTracePath_.empty()) {
+                ++traceMotionSerial_;
+                traceMotionDone_ = QpcNow();
+                traceMotionMs_ = QpcToMs(traceMotionDone_ - t0);
+            }
         }
     }
 }
 
 void App::StopScout() { scout_.reset(); }
+
+// An engagement that started on an explicit ON or before the first media poll must still be
+// backed by a playing session once that grace ends. A proven one survives a pause, whose
+// return must stay instant, but not a page that stopped being a video long ago.
+void App::CheckMediaGate(int64_t now) {
+    if (!engaged_) {
+        mediaProven_ = false;
+        mediaIdleSinceQpc_ = 0;
+        return;
+    }
+    if (media_.State() == MediaState::kPlaying) mediaProven_ = true;
+    if (MediaGateOpen(now)) {
+        mediaIdleSinceQpc_ = 0;
+        return;
+    }
+    if (mediaIdleSinceQpc_ == 0) mediaIdleSinceQpc_ = now;
+    if (QpcToSec(now - mediaIdleSinceQpc_) > (mediaProven_ ? 30.0 : 0.0)) {
+        Log("no media session is playing (%s) - disengaging", mediaProven_ ? "after a long pause" : "never was");
+        Disengage();
+    }
+}
+
+void App::ToggleGeneration(const char* source) {
+    wantShown_ = !wantShown_;
+    if (!wantShown_ && overlay_) overlay_->Hide();
+    if (wantShown_) {
+        // An explicit request must not sit behind an old failed search's cooldown
+        // or depend on Chrome publishing a system media session for this video.
+        const int64_t now = QpcNow();
+        manualScoutUntil_ = now + 20 * QpcPerSecond();
+        scoutSearchQpc_ = now;
+        rescoutHoldUntil_ = 0;
+        shortGiveUps_ = 0;
+        scoutFailQpc_ = 0;
+        engageNow_ = true;
+    }
+    tray_.SetEngineOn(wantShown_);
+    lastTrayStatus_ = 0;
+    Log("frame generation %s (%s)", wantShown_ ? "ON" : "OFF", source);
+}
 
 // Chrome's page area: the largest visible Chrome_RenderWidgetHostHWND under the window.
 HWND FindRenderWidget(HWND top) {
@@ -1532,7 +1656,7 @@ void App::Scout(int64_t now) {
     const bool want = WindowedAuto() && !engaged_ && wantShown_ && !gamePaused_ &&
                       !watch_.MoveSizeActive() && !haveAutoRect_ &&
                       (opt_.targetFromCli || settings_.captureChrome) &&
-                      (opt_.scoutAlways || media_.State() != MediaState::kIdle) &&
+                      MediaGateOpen(now) &&
                       (scoutFailQpc_ == 0 || QpcToSec(now - scoutFailQpc_) > 10.0) &&
                       now >= rescoutHoldUntil_;
     if (!want) {
@@ -1585,7 +1709,7 @@ void App::Scout(int64_t now) {
                           memcmp(&scoutTarget_.frameBounds, &t.frameBounds, sizeof(RECT)) == 0;
         if (!same) {
             StopScout();
-            scout_ = std::make_unique<DamageScout>();
+            scout_ = std::make_unique<DamageScout>(captureRuntime_);
             std::string err;
             if (!scout_->Start(t.hwnd, &err)) {
                 LogErr("windowed video: cannot watch the browser window (%s) - retrying in 10 s",
@@ -1596,13 +1720,21 @@ void App::Scout(int64_t now) {
             }
             scoutFailQpc_ = 0;
             scoutStartQpc_ = now;
-            finder_.Reset(scout_->SurfaceW(), scout_->SurfaceH(), vp);
+            const double aspect = autoTarget_.hwnd == t.hwnd && autoTarget_.pid == t.pid && autoTarget_.title == t.title &&
+                                  RectH(autoSurface_) > 0 ?
+                static_cast<double>(RectW(autoSurface_)) / RectH(autoSurface_) : 0.0;
+            const bool sameFrame = memcmp(&autoTarget_.frameBounds, &t.frameBounds, sizeof(RECT)) == 0;
+            finder_.Reset(scout_->SurfaceW(), scout_->SurfaceH(), vp, aspect, aspect > 0.0 && sameFrame ? autoSurface_ : RECT{});
             scoutViewport_ = vp;
             Log("windowed video: looking for the video in 0x%p \"%s\" (media %s, page area %s)",
                 static_cast<void*>(t.hwnd), Narrow(t.title).c_str(), MediaStateName(media_.State()),
                 RectStr(vp).c_str());
-        } else if (memcmp(&vp, &scoutViewport_, sizeof(RECT)) != 0) {
-            finder_.Reset(scout_->SurfaceW(), scout_->SurfaceH(), vp);  // the page area moved
+        } else if (memcmp(&vp, &scoutViewport_, sizeof(RECT)) != 0 || t.title != scoutTarget_.title) {
+            const double aspect = autoTarget_.hwnd == t.hwnd && autoTarget_.pid == t.pid && autoTarget_.title == t.title &&
+                                  RectH(autoSurface_) > 0 ?
+                static_cast<double>(RectW(autoSurface_)) / RectH(autoSurface_) : 0.0;
+            const bool sameFrame = memcmp(&autoTarget_.frameBounds, &t.frameBounds, sizeof(RECT)) == 0;
+            finder_.Reset(scout_->SurfaceW(), scout_->SurfaceH(), vp, aspect, aspect > 0.0 && sameFrame ? autoSurface_ : RECT{});
             scoutViewport_ = vp;
         }
         scoutTarget_ = t;
@@ -1679,7 +1811,9 @@ void App::GuardCapture() {
 void App::Tick() {
     if (!engaged_) return;
 
+    const int64_t traceStart = presentTracePath_.empty() ? 0 : QpcNow();
     PollCapture();
+    const double tracePollMs = traceStart ? QpcToMs(QpcNow() - traceStart) : 0.0;
     const double now100 = Qpc100nsNow();
 
     if (capture_->NeedsReengage()) {
@@ -1713,6 +1847,56 @@ void App::Tick() {
             overlay_->Hide();
             Log("source stalled (%.0f ms without a frame) - overlay hidden", sinceIngestMs);
         }
+    }
+
+    // A rate-gated output is scheduled on this monitor's refresh, even though
+    // Tick() wakes on the desktop compositor clock. Evaluate its phase at the
+    // scheduled output instant so source motion advances evenly between the
+    // presents that will actually be shown (P25). The ungated path keeps using
+    // the current QPC time as before.
+    double display100 = now100;
+    if (rateGate_) {
+        const int64_t nowQpc = QpcNow();
+        const int64_t gatePeriod = static_cast<int64_t>(QpcPerSecond() / targetHz_);
+        if (nextPresentQpc_ == 0) {
+            nextPresentQpc_ = nowQpc;
+            gateLastTickQpc_ = 0;
+            gateSkips_ = gateResyncs_ = gateIntervals_ = gatePhaseSamples_ = 0;
+            gateIntervalSumMs_ = gateIntervalMinMs_ = gateIntervalMaxMs_ = 0.0;
+            gatePhaseAbsSumMs_ = gatePhaseMinMs_ = gatePhaseMaxMs_ = 0.0;
+        } else if (nowQpc < nextPresentQpc_ - gatePeriod / 4) {
+            ++gateSkips_;
+            return;  // too early for this output: capture was polled, present is not due
+        }
+
+        int64_t displayQpc = nextPresentQpc_;
+        nextPresentQpc_ += gatePeriod;
+        // Never accumulate a backlog: after a stall, restart from now and use
+        // that same instant for the frame being rendered now.
+        if (nextPresentQpc_ < nowQpc - gatePeriod) {
+            ++gateResyncs_;
+            displayQpc = nowQpc;
+            nextPresentQpc_ = nowQpc + gatePeriod;
+        }
+        if (gateLastTickQpc_ != 0) {
+            const double intervalMs = QpcToMs(nowQpc - gateLastTickQpc_);
+            if (intervalMs > 0.0 && intervalMs < 100.0) {
+                if (gateIntervals_ == 0) gateIntervalMinMs_ = gateIntervalMaxMs_ = intervalMs;
+                gateIntervalSumMs_ += intervalMs;
+                gateIntervalMinMs_ = (std::min)(gateIntervalMinMs_, intervalMs);
+                gateIntervalMaxMs_ = (std::max)(gateIntervalMaxMs_, intervalMs);
+                ++gateIntervals_;
+            }
+        }
+        gateLastTickQpc_ = nowQpc;
+        const double scheduleOffsetMs = QpcToMs(nowQpc - displayQpc);
+        if (gatePhaseSamples_ == 0) gatePhaseMinMs_ = gatePhaseMaxMs_ = scheduleOffsetMs;
+        gatePhaseAbsSumMs_ += fabs(scheduleOffsetMs);
+        gatePhaseMinMs_ = (std::min)(gatePhaseMinMs_, scheduleOffsetMs);
+        gatePhaseMaxMs_ = (std::max)(gatePhaseMaxMs_, scheduleOffsetMs);
+        ++gatePhaseSamples_;
+        display100 = static_cast<double>(displayQpc) * 10000000.0 /
+                     static_cast<double>(QpcPerSecond());
     }
 
     // ---- phase
@@ -1761,7 +1945,7 @@ void App::Tick() {
         // pair is whichever of the two in hand brackets the moment on screen.
         const double P = timeline_.Period100ns();
         lag = P + delay + timeline_.Margin100ns();
-        const double shown = now100 - lag;
+        const double shown = display100 - lag;
         tA = timeline_.TimeOf(kPrev_);
         tB = timeline_.TimeOf(kNewest_);
         if (shown < tA && kOlder_ >= 0 && kOlder_ < kPrev_ && capture_->OlderSrv() &&
@@ -1779,7 +1963,7 @@ void App::Tick() {
     double uRaw = 0.0;
     if (usePair) {
         const double span = tB - tA > 0.0 ? tB - tA : period;
-        const double u = (now100 - lag - tA) / span;
+        const double u = (display100 - lag - tA) / span;
         uRaw = u;
         ++pairTicks_;
         if (olderPair) ++olderPairTicks_;
@@ -1801,29 +1985,12 @@ void App::Tick() {
         }
     }
 
-    // Rate gate. The compositor clock ticks at the fastest output on the
-    // desktop, so on a 60 Hz secondary monitor it would still wake us 165 times
-    // a second. Presenting only when this monitor's next refresh is due keeps
-    // the generated rate at the rate that is actually scanned out.
-    const int64_t nowQpc = QpcNow();
-    if (rateGate_) {
-        // gatePeriod, not "period": the enclosing scope already has a SOURCE
-        // period in 100 ns units, and the two used to share a name.
-        const int64_t gatePeriod = static_cast<int64_t>(QpcPerSecond() / targetHz_);
-        if (nextPresentQpc_ == 0) {
-            nextPresentQpc_ = nowQpc;
-        } else if (nowQpc < nextPresentQpc_ - gatePeriod / 4) {
-            ++gateSkips_;
-            return;  // too early for this output: capture was polled, present is not due
-        }
-        nextPresentQpc_ += gatePeriod;
-        // Never accumulate a backlog: after a stall, restart from now.
-        if (nextPresentQpc_ < nowQpc - gatePeriod) nextPresentQpc_ = nowQpc + gatePeriod;
-    }
-
     ID3D11Texture2D* back = nullptr;
     ID3D11RenderTargetView* rtv = nullptr;
-    if (!overlay_->AcquireBackBuffer(&back, &rtv)) {
+    const int64_t acquireStart = QpcNow();
+    const bool acquired = overlay_->AcquireBackBuffer(&back, &rtv);
+    acquireCpu_.Add(acquireStart);
+    if (!acquired) {
         // A back buffer we cannot get is a lost device, not a skipped frame.
         // This used to `return`, which left the engine "engaged" for ever after a
         // TDR: every tick failed here, nothing re-engaged, and the last picture
@@ -1835,6 +2002,7 @@ void App::Tick() {
         return;
     }
 
+    const int64_t drawStart = QpcNow();
     if (usePair) {
         const UINT vw = static_cast<UINT>(RectW(overlay_->VideoRect()));
         const UINT vh = static_cast<UINT>(RectH(overlay_->VideoRect()));
@@ -1863,14 +2031,34 @@ void App::Tick() {
         synth_->DrawFpsText(rtv, vw, vh, static_cast<float>(vw) - 12.0f, 12.0f, fontPx, FpsText());
     }
 
-    if (!overlay_->Present()) {
+    drawCpu_.Add(drawStart);
+    const int64_t presentStart = QpcNow();
+    const auto present = overlay_->Present();
+    presentCpu_.Add(presentStart);
+    if (present == Overlay::PresentResult::DeviceLost) {
         LogErr("device lost on present - re-engaging");
         faultDisengage_ = true;
         Disengage();
         return;
     }
+    if (present == Overlay::PresentResult::Skipped) {
+        // Do not count a rejected submission or show an unpresented first frame.
+        // Reset the judder baseline: this output instant never reached DXGI.
+        judderLastWall100ns_ = 0.0;
+        return;
+    }
     ++presents_;
     ++badgeFrames_;
+    if (!presentTracePath_.empty() && !presentTraceFull_) {
+        if (presentTrace_.size() < 60000) {
+            presentTrace_.push_back({QpcNow(), tA, tB, t, tracePollMs, traceMotionMs_, traceMotionSerial_,
+                                     traceMotionDone_, kPrev_, kNewest_, olderPair, usePair,
+                                     overlay_->TracePresentation()});
+        } else {
+            presentTraceFull_ = true;
+            LogErr("presentation trace reached 60000 rows; further samples omitted");
+        }
+    }
 
     if (overlay_->IsShown()) {
         const double content = usePair ? tA + t * (tB - tA) : capture_->NewestTime100ns();
@@ -1881,7 +2069,7 @@ void App::Tick() {
         // are counted apart so they cannot drown the number that matters.
         const bool sourceHolding = usePair && uRaw > 1.6;
         if (judderLastWall100ns_ > 0.0 && !sourceHolding) {
-            const double dWallMs = (now100 - judderLastWall100ns_) / 10000.0;
+            const double dWallMs = (display100 - judderLastWall100ns_) / 10000.0;
             const double err = fabs((content - judderLastContent100ns_) / 10000.0 - dWallMs);
             if (dWallMs > 0.0 && dWallMs < 100.0) {
                 if (period > 0.0 && err > 3.0 * period / 10000.0) {
@@ -1896,7 +2084,7 @@ void App::Tick() {
             ++judderHolding_;
         }
         judderLastContent100ns_ = content;
-        judderLastWall100ns_ = now100;
+        judderLastWall100ns_ = display100;
     } else {
         judderLastWall100ns_ = 0.0;
     }
@@ -2092,6 +2280,16 @@ void App::LogStats() {
             case 3: mode = "FAILURE"; break;
             default: break;
         }
+        const OverlayMediaStats media = overlay_->TakeMediaStats();
+        if (media.available && media.samples) {
+            Log("  scan-out: DXGI reports %llu shown images across %llu samples | same v-blank %llu, skipped v-blanks %llu, discontinuities %llu | present refresh %u, sync refresh %u",
+                static_cast<unsigned long long>(media.framesShown),
+                static_cast<unsigned long long>(media.samples),
+                static_cast<unsigned long long>(media.sameRefresh),
+                static_cast<unsigned long long>(media.skippedRefreshes),
+                static_cast<unsigned long long>(media.discontinuities),
+                media.lastPresentRefreshCount, media.lastSyncRefreshCount);
+        }
     }
     double ilo = 0.0, imid = 0.0, ihi = 0.0;
     cadence_.IntervalSpreadMs(&ilo, &imid, &ihi);
@@ -2105,6 +2303,17 @@ void App::LogStats() {
         timeline_.Ready() ? "locked" : "not locked", timeline_.Period100ns() / 10000.0,
         timeline_.Margin100ns() / 10000.0, static_cast<unsigned long long>(olderPairTicks_),
         static_cast<unsigned long long>(pairTicks_));
+    if (rateGate_ && gatePhaseSamples_) {
+        Log("  rate gate: early loops %llu, resyncs %llu | actual tick interval mean/min/max %.2f/%.2f/%.2f ms | QPC schedule offset mean-abs/min/max %.2f/%.2f/%.2f ms",
+            static_cast<unsigned long long>(gateSkips_),
+            static_cast<unsigned long long>(gateResyncs_),
+            gateIntervals_ ? gateIntervalSumMs_ / gateIntervals_ : 0.0,
+            gateIntervals_ ? gateIntervalMinMs_ : 0.0, gateIntervals_ ? gateIntervalMaxMs_ : 0.0,
+            gatePhaseAbsSumMs_ / gatePhaseSamples_, gatePhaseMinMs_, gatePhaseMaxMs_);
+    }
+    gateResyncs_ = gateIntervals_ = gatePhaseSamples_ = 0;
+    gateIntervalSumMs_ = gateIntervalMinMs_ = gateIntervalMaxMs_ = 0.0;
+    gatePhaseAbsSumMs_ = gatePhaseMinMs_ = gatePhaseMaxMs_ = 0.0;
     olderPairTicks_ = pairTicks_ = 0;
     Log("in %.1f fps (est. source %.2f fps, delay %.1f ms) | out %.1f fps | %s | plane %s | "
         "phase %.2f..%.2f held %llu | loop %.0f/s (clock %.1f + wait %.1f + tick %.1f ms) | %s",
@@ -2142,13 +2351,22 @@ void App::LogStats() {
         occlUsSum_ = occlUsMax_ = 0.0;
     }
 
+    const auto logCpu = [](const char* name, const CpuStage& stage) {
+        Log("  CPU stage %s: mean %.3f ms, max %.3f ms, %llu calls (submission, not GPU time)",
+            name, stage.runs ? stage.totalMs / static_cast<double>(stage.runs) : 0.0,
+            stage.maxMs, static_cast<unsigned long long>(stage.runs));
+    };
+    logCpu("capture", captureCpu_);
+    logCpu("motion", motionCpu_);
+    logCpu("acquire", acquireCpu_);
+    logCpu("draw", drawCpu_);
+    logCpu("present", presentCpu_);
+    captureCpu_ = motionCpu_ = acquireCpu_ = drawCpu_ = presentCpu_ = {};
     statsQpc_ = now;
     subTickPolls_ = 0;
     ticks_ = 0;
     gateSkips_ = 0;
     msClock_ = msWait_ = msTick_ = 0;
-    motionCpuMs_ = 0.0;
-    motionRuns_ = 0;
     presents_ = 0;
     framesAtStats_ = frames;
     uMin_ = 2.0;
@@ -2157,6 +2375,10 @@ void App::LogStats() {
 }
 
 int App::Run() {
+    if (traceInitFailed_) {
+        LogErr("reading NSP_PRESENT_TRACE failed");
+        return 1;
+    }
     auto waitClock = LoadCompositorClock();
     if (!waitClock)
         LogErr("DCompositionWaitForCompositorClock unavailable - falling back to Sleep(1); "
@@ -2243,11 +2465,7 @@ int App::Run() {
 
         switch (tray_.Poll()) {
             case Tray::Command::kToggle:
-                wantShown_ = !wantShown_;
-                if (!wantShown_ && overlay_) overlay_->Hide();
-                tray_.SetEngineOn(wantShown_);
-                lastTrayStatus_ = 0;
-                Log("frame generation %s (tray)", wantShown_ ? "ON" : "OFF");
+                ToggleGeneration("tray");
                 break;
             case Tray::Command::kSettingsChanged:
                 ApplySettings(tray_.CurrentSettings());
@@ -2277,13 +2495,7 @@ int App::Run() {
                         break;
                     case kHkToggle:
                     case kHkToggle2:
-                        wantShown_ = !wantShown_;
-                        if (!wantShown_ && overlay_) overlay_->Hide();
-                        tray_.SetEngineOn(wantShown_);
-                        lastTrayStatus_ = 0;
-                        Log("frame generation %s (Ctrl+Alt+Q) - the PROGRAM keeps running; "
-                            "Ctrl+Alt+X or the tray menu quits",
-                            wantShown_ ? "ON" : "OFF");
+                        ToggleGeneration("Ctrl+Alt+Q/O");
                         break;
                     case kHkMode:
                         opt_.mode = NextMode(opt_.mode);
@@ -2602,6 +2814,12 @@ int App::Run() {
                     const double oldMax = desktopMaxHz_;
                     desktopMaxHz_ = maxHz;
                     rateGate_ = hz < desktopMaxHz_ - 1.0;
+                    if (!overlay_->SetFrameLatency(rateGate_ ? 1U : 2U)) {
+                        LogErr("output frame-latency update failed - re-engaging");
+                        faultDisengage_ = true;
+                        Disengage();
+                        continue;
+                    }
                     Log("output refresh %.3f -> %.3f Hz (desktop max %.3f -> %.3f) - generation %s",
                         targetHz_, hz, oldMax, maxHz,
                         rateGate_ ? "paced down to this monitor" : "follows the compositor clock");
@@ -2619,6 +2837,7 @@ int App::Run() {
         // straight to the 10 s ceiling (review, 2026-09-20).
         const double reengageAfter =
             engageCostly_ ? (std::min)(10.0, 1.0 + 0.5 * static_cast<double>(costlyFails_)) : 1.0;
+        CheckMediaGate(now);
         Scout(now);
         if (engageNow_) {
             engageNow_ = false;
@@ -2631,7 +2850,10 @@ int App::Run() {
                 // overlay_ survives a failed Engage, so its presence says how far
                 // the attempt got.
                 engageCostly_ = overlay_ != nullptr;
-                if (engageCostly_) ++costlyFails_;
+                if (engageCostly_) {
+                    ++costlyFails_;
+                    faultDisengage_ = true;
+                }
                 // Once, then every 30 s. Waiting for Chrome is the normal state
                 // of a background tool, and a line a second would bury the log
                 // that matters when it finally attaches.
@@ -2664,10 +2886,55 @@ int App::Run() {
     tray_.Destroy();
     StopScout();
     Disengage();
+    captureRuntime_.reset();
     media_.Stop();
     watch_.Stop();
     UninstallHotkeys();
-    return 0;
+    return WritePresentTrace() && !traceInitFailed_ ? 0 : 1;
+}
+
+bool App::WritePresentTrace() {
+    if (presentTracePath_.empty()) return true;
+    FILE* file = nullptr;
+    if (fopen_s(&file, presentTracePath_.c_str(), "wb") != 0 || !file) {
+        LogErr("cannot create presentation trace: %s", presentTracePath_.c_str());
+        return false;
+    }
+    bool ok = fprintf(file, "qpc_ms,a_ms,b_ms,phase,content_ms,poll_ms,motion_ms,motion_serial,motion_done_ms,previous,newest,older,pair,submitted,displayed,refresh,sync_qpc_ms,submitted_hr,media_valid\n") >= 0;
+    for (const auto& row : presentTrace_) {
+        if (!ok) break;
+        const double content = row.a + row.phase * (row.b - row.a);
+        ok = fprintf(file, "%.6f,%.6f,%.6f,%.9f,%.6f,%.6f,%.6f,%llu,%.6f,%lld,%lld,%d,%d,%u,%u,%u,%.6f,%ld,%d\n",
+                     QpcToMs(row.qpc), row.a / 10000.0, row.b / 10000.0, row.phase, content / 10000.0,
+                     row.pollMs, row.motionMs, static_cast<unsigned long long>(row.motionSerial), QpcToMs(row.motionDone),
+                     static_cast<long long>(row.previous), static_cast<long long>(row.newest),
+                     row.older ? 1 : 0, row.pair ? 1 : 0, row.media.submitted, row.media.displayed,
+                     row.media.refresh, QpcToMs(row.media.syncQpc), static_cast<long>(row.media.submittedHr),
+                     row.media.mediaValid ? 1 : 0) >= 0;
+    }
+    if (fclose(file) != 0) ok = false;
+    const std::string gpuPath = presentTracePath_ + ".gpu.csv";
+    file = nullptr;
+    if (fopen_s(&file, gpuPath.c_str(), "wb") != 0 || !file) {
+        LogErr("cannot create motion GPU trace: %s", gpuPath.c_str());
+        return false;
+    }
+    ok = fprintf(file, "motion_serial,gpu_ms,disjoint,frequency,status\n") >= 0 && ok;
+    for (const auto& gpu : motionGpuTrace_) {
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+        UINT64 begin = 0, end = 0;
+        HRESULT hr = gpu.context->GetData(gpu.disjoint.Get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr == S_OK) hr = gpu.context->GetData(gpu.begin.Get(), &begin, sizeof(begin), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr == S_OK) hr = gpu.context->GetData(gpu.end.Get(), &end, sizeof(end), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        const double ms = hr == S_OK && !disjoint.Disjoint && disjoint.Frequency && end >= begin ?
+            1000.0 * static_cast<double>(end - begin) / static_cast<double>(disjoint.Frequency) : -1.0;
+        if (fprintf(file, "%llu,%.6f,%d,%llu,%ld\n", static_cast<unsigned long long>(gpu.serial), ms,
+                    disjoint.Disjoint ? 1 : 0, static_cast<unsigned long long>(disjoint.Frequency),
+                    static_cast<long>(hr)) < 0) ok = false;
+    }
+    if (fclose(file) != 0) ok = false;
+    if (!ok) LogErr("writing presentation trace failed: %s", presentTracePath_.c_str());
+    return ok;
 }
 
 // The value after `flag` on the WIDE command line (the last one, as ParseArgs keeps). argv is in
@@ -3044,8 +3311,8 @@ int RunMain(int argc, char** argv) {
     // existence is the whole signal.
     HANDLE appMutex = CreateMutexW(nullptr, FALSE, L"NovaSilkPlayAppMutex");
 
-    // Keep the Run value pointing at THIS executable after a reinstall into a
-    // different folder. It never creates one that is not already there.
+    // Migrate enabled legacy Run entries; repair missing shortcut targets only.
+    // Running a development build never redirects a working installed shortcut.
     AutostartRepair();
 
     // Manual-reset and created here, not opened: we own it, and a stale set

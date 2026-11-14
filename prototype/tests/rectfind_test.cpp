@@ -286,13 +286,53 @@ static void TestCornerClippedUnion() {
     for (double t = 0; t < 1.6; t += 1.0 / 19.0) f.Add(t, Sig({unionGlow}));
     RECT v{};
     CHECK(!f.Found(1.6, &v, nullptr));
-    // A video scrolled half out at the TOP only is still a video.
+    // One clipped vertical edge also leaves the complete geometry uncertain.
     RectFinder g;
     g.Reset(kSW, kSH, vp);
     const RECT half = R(44, 95, 1058, 285);
     for (double t = 0; t < 1.6; t += 1.0 / 24.0) g.Add(t, Sig({half}));
-    CHECK(g.Found(1.6, &v, nullptr));
-    CHECK(Eq(v, half));
+    CHECK(!g.Found(1.6, &v, nullptr));
+}
+
+static void TestAllohaViewportClip() {
+    printf("alloha_clipped_surround_is_not_the_video\n");
+    const RECT vp = R(60, 152, 2501, 1241);
+    RECT found{};
+    for (const RECT candidate : {R(816, 716, 1132, 676), R(1047, 716, 900, 676)}) {
+        RectFinder f;
+        f.Reset(2560, 1392, vp);
+        for (int n = 0; n < 36; ++n) f.Add(n / 24.0, Sig({candidate}));
+        CHECK(!f.Found(1.5, &found, nullptr));
+    }
+    // The measured picture and a fully visible full-width theater layout still attach.
+    for (const RECT candidate : {R(816, 778, 992, 528), R(60, 300, 2500, 900)}) {
+        RectFinder f;
+        f.Reset(2560, 1392, vp);
+        for (int n = 0; n < 36; ++n) f.Add(n / 24.0, Sig({candidate}));
+        CHECK(f.Found(1.5, &found, nullptr));
+        CHECK(Eq(found, candidate));
+    }
+}
+
+static void TestAdjacentPageRepaint() {
+    printf("page_repaint_sharing_video_edges_does_not_hide_it\n");
+    const RECT video = R(45, 201, 1056, 594);
+    GeometryGuard g;
+    g.Begin(0.0, video, {}, 1744, 1147, R(1, 95, 1744, 1053));
+    for (int n = 0; n < 6; ++n) g.Add(0.1 + n / 24.0, Sig({video}));
+    CHECK(!g.Suspect());
+    // Measured Chrome repaint: every surrounding pixel, but none inside the video.
+    const DamageSig ring = Sig({R(1, 0, 1744, 201), R(1, 201, 44, 594),
+                                R(1101, 201, 644, 594), R(1, 795, 1744, 352)});
+    CHECK(g.Add(0.32, ring) == GeomVerdict::kElsewhere);
+    g.Tick(0.33);
+    CHECK(!g.Suspect());
+    CHECK(g.Add(0.34, Sig({video})) == GeomVerdict::kExact);
+    // A real one-pixel intrusion still needs confirmation, and a scroll hides at once.
+    CHECK(g.Add(0.35, Sig({R(1, 201, 45, 594)})) == GeomVerdict::kPending);
+    g.Tick(0.46);
+    CHECK(g.Suspect());
+    CHECK(g.Add(0.47, Sig({R(0, 0, 1744, 1147)})) == GeomVerdict::kForeign);
 }
 
 static void TestBurstIsNotAVideo() {
@@ -342,7 +382,92 @@ static void TestOverflow() {
     CHECK(g.Add(0.1, d) == GeomVerdict::kForeign);
 }
 
+static void TestSplitVideoDamage() {
+    printf("split_video_damage_with_unrelated_animation\n");
+    const RECT video = R(326, 195, 1909, 1074);
+    const RECT viewport = R(0, 133, 2561, 1260);
+    RectFinder f;
+    f.Reset(2560, 1392, viewport);
+    // Owner's log: the bottom of the video is split where an animation beside it
+    // intersects its scanlines. The split height changes between captures.
+    for (int n = 0; n < 36; ++n) {
+        const LONG h = (n % 2) ? 989 : 1001;
+        f.Add(n / 24.0, Sig({R(326, 195, 1909, h), R(12, 195 + h, 145, 15),
+                             R(326, 195 + h, 1909, 15), R(326, 210 + h, 1909, 1059 - h)}));
+    }
+    RECT found{};
+    CHECK(f.Found(1.5, &found, nullptr));
+    CHECK(Eq(found, video));
+    GeometryGuard g;
+    g.Begin(1.5, video, {}, 2560, 1392, viewport);
+    for (int n = 0; n < 8; ++n)
+        CHECK(g.Add(1.51 + n / 24.0, Sig({R(326, 195, 1909, 989), R(12, 1184, 145, 15),
+                    R(326, 1184, 1909, 15), R(326, 1199, 1909, 70)})) == GeomVerdict::kExact);
+    CHECK(!g.Suspect());
+    CHECK(g.Add(2.0, Sig({viewport})) == GeomVerdict::kForeign);
+    CHECK(g.Suspect());  // coalescing must not weaken the scroll gate
+    CHECK(Sig({R(0, 0, 100, 50), R(0, 51, 100, 50)}).Normalized().n == 2);  // a gap
+    CHECK(Sig({R(0, 0, 100, 50), R(100, 50, 100, 50)}).Normalized().n == 2); // corner
+    CHECK(Sig({R(0, 0, 50, 100), R(50, 0, 50, 100)}).Normalized().n == 1);
+    CHECK(Sig({R(0, 0, 100, 50), R(0, 50, 50, 50)}).Normalized().n == 2); // L shape
+}
+
+static void TestLockstepAdjacentDamage() {
+    printf("lockstep_adjacent_damage_is_not_video_geometry\n");
+    const RECT video = R(100, 200, 960, 540);
+    for (int axis = 0; axis < 2; ++axis) {
+        RectFinder f;
+        f.Reset(1600, 1000, R(0, 90, 1600, 910));
+        for (int n = 0; n < 36; ++n) {
+            const RECT strip = axis ? R(1060, 200, 32, 540) : R(100, 740, 960, 32);
+            f.Add(n / 24.0, Sig({video, strip, R(1300, 100, 40 + n % 2, 40)}));
+        }
+        RECT found{};
+        CHECK(!f.Found(1.5, &found, nullptr));
+    }
+    // Changing subdivisions of the animation must not erase its stable border
+    // with the video. A single whole-union repaint is not sufficient evidence.
+    RectFinder f;
+    f.Reset(1600, 1000, R(0, 90, 1600, 910));
+    for (int n = 0; n < 36; ++n) {
+        const LONG h = n % 2 ? 12 : 20;
+        if (n == 24)
+            f.Add(n / 24.0, Sig({R(100, 200, 960, 572)}));
+        else
+            f.Add(n / 24.0, Sig({video, R(100, 740, 960, h), R(100, 740 + h, 960, 32 - h)}));
+    }
+    RECT found{};
+    CHECK(!f.Found(1.5, &found, nullptr));
+}
+
+static void TestRememberedAspect() {
+    RectFinder f;
+    const RECT vp = R(0, 90, 1600, 810);
+    RECT found{};
+    f.Reset(1600, 900, vp, 16.0 / 9.0);
+    for (int n = 0; n < 36; ++n) f.Add(n / 24.0, Sig({R(100, 200, 960, 500)}));
+    CHECK(!f.Found(1.5, &found, nullptr));
+    f.Reset(1600, 900, vp, 16.0 / 9.0);
+    for (int n = 0; n < 36; ++n) f.Add(n / 24.0, Sig({R(100, 200, 1200, 675)}));
+    CHECK(f.Found(1.5, &found, nullptr));
+    // A new format centred in the same player is distinct from a scrolled crop.
+    f.Reset(1600, 900, vp, 16.0 / 9.0, R(100, 200, 960, 540));
+    for (int n = 0; n < 36; ++n) f.Add(n / 24.0, Sig({R(100, 220, 960, 500)}));
+    CHECK(f.Found(1.5, &found, nullptr));
+    f.Reset(1600, 900, vp, 16.0 / 9.0, R(100, 200, 960, 540));
+    for (int n = 0; n < 36; ++n) f.Add(n / 24.0, Sig({R(100, 210, 960, 500)}));
+    CHECK(!f.Found(1.5, &found, nullptr));
+    f.Reset(1600, 900, vp);
+    for (int n = 0; n < 36; ++n) f.Add(n / 24.0, Sig({R(100, 200, 960, 500)}));
+    CHECK(f.Found(1.5, &found, nullptr));
+}
+
 int main() {
+    TestRememberedAspect();
+    TestLockstepAdjacentDamage();
+    TestAdjacentPageRepaint();
+    TestAllohaViewportClip();
+    TestSplitVideoDamage();
     TestFindsVideo();
     TestAmbientCompanion();
     TestTheaterRing();

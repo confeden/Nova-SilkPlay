@@ -6,6 +6,7 @@ features a GPU can reduce to one number without a readback, and prints their dis
 over the pairs labelled as cuts and over everything else:
 
   hist   half the L1 distance between 16-band luma histograms (0 same .. 1 disjoint)
+  spatial mean half-L1 distance of those histograms averaged over a 4x4 image grid
   mean   |mean luma difference| / 255
   std    |luma standard deviation difference| / 255
   grid   mean |difference| of a 4x4 grid of block-mean lumas / 255 (coarse layout)
@@ -26,14 +27,39 @@ def luma(path):
     return 0.2126 * f[..., 0] + 0.7152 * f[..., 1] + 0.0722 * f[..., 2]
 
 
+def tone_hist(y):
+    return np.bincount(np.clip((y / 16).astype(int), 0, 15).ravel(), minlength=16) / y.size
+
+
 def features(ya, yb):
-    ha = np.bincount(np.clip((ya / 16).astype(int), 0, 15).ravel(), minlength=16) / ya.size
-    hb = np.bincount(np.clip((yb / 16).astype(int), 0, 15).ravel(), minlength=16) / yb.size
+    ha, hb = tone_hist(ya), tone_hist(yb)
     h, w = ya.shape
     ga = np.array([[ya[i * h // 4:(i + 1) * h // 4, j * w // 4:(j + 1) * w // 4].mean() for j in range(4)] for i in range(4)])
     gb = np.array([[yb[i * h // 4:(i + 1) * h // 4, j * w // 4:(j + 1) * w // 4].mean() for j in range(4)] for i in range(4)])
+    spatial = 0.0
+    for i in range(4):
+        for j in range(4):
+            ya_tile = ya[i * h // 4:(i + 1) * h // 4, j * w // 4:(j + 1) * w // 4]
+            yb_tile = yb[i * h // 4:(i + 1) * h // 4, j * w // 4:(j + 1) * w // 4]
+            ha_tile = np.bincount(np.clip((ya_tile / 16).astype(int), 0, 15).ravel(), minlength=16) / ya_tile.size
+            hb_tile = np.bincount(np.clip((yb_tile / 16).astype(int), 0, 15).ravel(), minlength=16) / yb_tile.size
+            spatial += 0.5 * np.abs(ha_tile - hb_tile).sum() / 16.0
+    # Match CSCutHist's sample locations and 8x8-cell quadrants. These values
+    # are still a CPU proxy: the shader samples linear-light sRGB resources.
+    yi = np.minimum(4 + 8 * np.arange((ya.shape[0] + 7) // 8), ya.shape[0] - 1)
+    xi = np.minimum(4 + 8 * np.arange((ya.shape[1] + 7) // 8), ya.shape[1] - 1)
+    ya8, yb8 = ya[np.ix_(yi, xi)], yb[np.ix_(yi, xi)]
+    h8, w8 = ya8.shape
+    spatial8 = 0.0
+    for top in (0, h8 // 2):
+        for left in (0, w8 // 2):
+            ya_tile = ya8[top:top + h8 // 2, left:left + w8 // 2]
+            yb_tile = yb8[top:top + h8 // 2, left:left + w8 // 2]
+            spatial8 += 0.5 * np.abs(tone_hist(ya_tile) - tone_hist(yb_tile)).sum() / 4.0
     return {
         "hist": 0.5 * np.abs(ha - hb).sum(),
+        "spatial": spatial,
+        "spatial8": spatial8,
         "mean": abs(ya.mean() - yb.mean()) / 255.0,
         "std": abs(ya.std() - yb.std()) / 255.0,
         "grid": np.abs(ga - gb).mean() / 255.0,
@@ -56,7 +82,7 @@ def main():
         rows.append((i - 1, features(prev, cur)))
         prev = cur
     print(f"{a.corpus} stride {a.stride}: {len(rows)} pairs, {len(cuts)} labelled cuts")
-    for name in ("hist", "mean", "std", "grid"):
+    for name in ("hist", "spatial", "spatial8", "mean", "std", "grid"):
         non = sorted(f[name] for i, f in rows if i not in cuts)
         cut = sorted(f[name] for i, f in rows if i in cuts)
         line = f"  {name:5s} non-cut max {non[-1]:.3f} p99 {non[int(0.99 * (len(non) - 1))]:.3f} median {non[len(non) // 2]:.3f}"

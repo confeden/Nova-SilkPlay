@@ -140,6 +140,9 @@ struct OfaFlow::Impl {
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = bind;
+        // Private allocations fail repeat identity with faster consumers (G111).
+        // Shared allocations match the explicit-fence backend in the same cases.
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
         const HRESULT hr = device->CreateTexture2D(&td, nullptr, out->ReleaseAndGetAddressOf());
         if (FAILED(hr)) {
             Add(Fmt("CreateTexture2D(%ux%u %s) failed %s", tw, th, DxgiFormatName(fmt),
@@ -316,6 +319,8 @@ bool OfaFlow::Create(ID3D11Device* device, ID3D11DeviceContext* ctx, UINT w, UIN
     if (d.hintsOn) {
         hr = device->CreateUnorderedAccessView(d.hint.Get(), nullptr, &d.hintUav);
         if (FAILED(hr)) return fail(Fmt("hint UAV creation failed %s", HrString(hr).c_str()));
+        const UINT zero[4] = {};
+        d.ctx->ClearUnorderedAccessViewUint(d.hintUav.Get(), zero);
         if (!d.Register(d.hint.Get(), &d.bHint, "external hint"))
             return fail("hint registration failed (see report)");
         d.Add(Fmt("external hints: ON, hintGridSize %u, %ux%u vectors, S10.5", d.grid, d.gridW, d.gridH));
@@ -328,7 +333,7 @@ bool OfaFlow::Create(ID3D11Device* device, ID3D11DeviceContext* ctx, UINT w, UIN
         !d.Register(d.costFwd.Get(), &d.bCostFwd, "cost fwd") ||
         !d.Register(d.costBwd.Get(), &d.bCostBwd, "cost bwd"))
         return fail("resource registration failed (see report)");
-    d.Add("nvOFRegisterResourceD3D11: 6 of our own textures registered");
+    d.Add("nvOFRegisterResourceD3D11: 6 of our own shared textures registered");
 
     d.ready = true;
     return true;
@@ -394,6 +399,9 @@ void OfaFlow::Destroy() {
     d.costBwdSrv.Reset();
     d.inPrevUav.Reset();
     d.inNextUav.Reset();
+    d.hintUav.Reset();
+    d.hint.Reset();
+    d.hintsOn = false;
     d.flowFwd.Reset();
     d.flowBwd.Reset();
     d.costFwd.Reset();

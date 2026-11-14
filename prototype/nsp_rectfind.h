@@ -44,6 +44,7 @@ struct DamageSig {
     bool overflow = false;
 
     bool Same(const DamageSig& o) const;  // the exact same rects in the same order
+    DamageSig Normalized() const;       // join full-edge strips, never fill gaps or corners
     RECT Bounds() const;
     std::string Str() const;              // "[x,y wxh] ..." for logs
 };
@@ -57,6 +58,7 @@ struct RectFinderConfig {
     LONG   minW = 256, minH = 144;
     double minAspect = 0.3, maxAspect = 8.0;  // w/h: vertical shorts to a video half scrolled away
     int    companionHits = 3;    // a repeating non-video shape in companionSec ...
+    int    minSplitWitnesses = 3; // observations crossing a formerly separate full-edge boundary
     double companionSec = 2.0;
     double maxCompanionViewportFrac = 0.90;  // ... that does not cover (almost) the whole surface
 };
@@ -66,7 +68,8 @@ class RectFinder {
 public:
     explicit RectFinder(RectFinderConfig cfg = {}) : cfg_(cfg) {}
     // `viewport`: the page area in surface coordinates (Chrome's render widget), or empty.
-    void Reset(LONG surfaceW, LONG surfaceH, const RECT& viewport = RECT{});
+    void Reset(LONG surfaceW, LONG surfaceH, const RECT& viewport = RECT{}, double expectedAspect = 0.0,
+               const RECT& reference = RECT{});
     void Add(double tSec, const DamageSig& d);
     // The video rect (surface coordinates) and the companions learned alongside it.
     bool Found(double tSec, RECT* video, std::vector<DamageSig>* companions) const;
@@ -78,11 +81,14 @@ private:
     struct Entry {
         double t;
         DamageSig d;
+        DamageSig raw;
     };
     bool Plausible(const RECT& r) const;
     RectFinderConfig cfg_;
     LONG surfW_ = 0, surfH_ = 0;
     RECT viewport_{};
+    double expectedAspect_ = 0.0;
+    RECT reference_{};
     std::vector<Entry> hist_;  // the last companionSec of captures, oldest first
 };
 

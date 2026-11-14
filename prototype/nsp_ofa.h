@@ -38,11 +38,10 @@ public:
     // only hintGridSize 4 and 8 initialise — the capability list claims 1 and 2
     // as well and the driver rejects them.
     //
-    // TWO TRAPS, both measured, both fatal if ignored. hintGridSize must stay
-    // UNDEFINED whenever hints are off or execute TDRs (G13). And an all-zero
-    // hint buffer is WORSE than no hints at all, because zero is not "no
-    // opinion", it is the assertion "nothing moved" — so a caller that enables
-    // hints owes a real field on EVERY execute.
+    // hintGridSize must stay
+    // UNDEFINED whenever hints are off or execute TDRs (G13). Hint mode with
+    // an explicitly zeroed buffer is intentional (G54); measured real seeds
+    // regress the current quality matrix. The caller may overwrite the zeros.
     bool Create(ID3D11Device* device, ID3D11DeviceContext* ctx, UINT w, UINT h, UINT gridSize,
                 std::string* err, bool wantHints = false);
     void Destroy();
@@ -66,7 +65,7 @@ public:
 
     // The hint surface, R16G16_SINT in S10.5 fixed point like the flow output,
     // sized GridW() x GridH(). Null unless Create() was asked for hints. Fill it
-    // before every Execute; see the zero-buffer trap above.
+    // before Execute when supplying a seed; otherwise the initial zeros persist.
     ID3D11UnorderedAccessView* HintUav() const;
     bool HintsEnabled() const;
 

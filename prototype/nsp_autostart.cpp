@@ -1,131 +1,181 @@
-// nsp_autostart.cpp — see nsp_autostart.h.
-
+// nsp_autostart.cpp — current-user Startup shortcut, with legacy Run migration.
 #include "nsp_autostart.h"
-
 #include "nsp_common.h"
-
-#include <string>
+#include <shlobj.h>
+#include <shobjidl.h>
+#include <shellapi.h>
+#include <wrl/client.h>
+#include <iterator>
 #include <vector>
 
 namespace nsp {
 namespace {
-
+using Microsoft::WRL::ComPtr;
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-constexpr wchar_t kApprovedKey[] =
-    L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+constexpr wchar_t kApprovedRun[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+constexpr wchar_t kApprovedFolder[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\StartupFolder";
 constexpr wchar_t kValue[] = L"Nova SilkPlay";
+constexpr wchar_t kShortcut[] = L"Nova SilkPlay.lnk";
 
-std::string StatusText(const char* step, LSTATUS st) {
-    char buf[256];
-    _snprintf_s(buf, _TRUNCATE, "autostart: %s failed (error %ld)", step, static_cast<long>(st));
-    return buf;
+bool Fail(const char* step, HRESULT hr, std::string* err) {
+    if (err) *err = std::string("autostart: ") + step + " failed: " + HrString(hr);
+    return false;
 }
-
-// The quoted full path of this executable, and nothing else. An autostart line
-// carrying flags reads as suspicious to a user inspecting it, and there is
-// nothing we need to pass.
-std::wstring SelfCommand() {
+std::wstring SelfPath() {
     std::vector<wchar_t> buf(MAX_PATH);
-    for (;;) {
+    while (buf.size() <= 65536) {
         const DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
-        if (n == 0) return std::wstring();
-        if (n < buf.size() - 1) return L"\"" + std::wstring(buf.data(), n) + L"\"";
+        if (n == 0) return {};
+        if (n < buf.size() - 1) return std::wstring(buf.data(), n);
         buf.resize(buf.size() * 2);
-        if (buf.size() > 65536) return std::wstring();
     }
+    return {};
 }
-
-// The Run value's string, or empty when there is none.
+bool ShortcutPath(std::wstring* path, std::string* err) {
+    PWSTR dir = nullptr;
+    const HRESULT hr = SHGetKnownFolderPath(FOLDERID_Startup, KF_FLAG_CREATE, nullptr, &dir);
+    if (FAILED(hr)) return Fail("locating the user's Startup folder", hr, err);
+    *path = std::wstring(dir) + L"\\" + kShortcut;
+    CoTaskMemFree(dir);
+    return true;
+}
 std::wstring ReadRunValue() {
-    wchar_t data[1024] = {};
+    wchar_t data[32768]{};
     DWORD cb = sizeof(data);
-    const LSTATUS st =
-        RegGetValueW(HKEY_CURRENT_USER, kRunKey, kValue, RRF_RT_REG_SZ, nullptr, data, &cb);
-    if (st != ERROR_SUCCESS) return std::wstring();
-    return std::wstring(data);
+    const LSTATUS st = RegGetValueW(HKEY_CURRENT_USER, kRunKey, kValue, RRF_RT_REG_SZ, nullptr, data, &cb);
+    if (st != ERROR_SUCCESS && st != ERROR_FILE_NOT_FOUND && st != ERROR_PATH_NOT_FOUND)
+        LogErr("autostart: reading the legacy Run entry failed (%ld)", st);
+    return st == ERROR_SUCCESS ? std::wstring(data) : std::wstring();
 }
-
+bool Blocked(const wchar_t* key, const wchar_t* name) {
+    BYTE blob[64]{};
+    DWORD cb = sizeof(blob);
+    const LSTATUS st = RegGetValueW(HKEY_CURRENT_USER, key, name, RRF_RT_REG_BINARY, nullptr, blob, &cb);
+    if (st != ERROR_SUCCESS && st != ERROR_FILE_NOT_FOUND && st != ERROR_PATH_NOT_FOUND) {
+        LogErr("autostart: reading StartupApproved failed (%ld) - preserving a possible disable", st);
+        return true;
+    }
+    return st == ERROR_SUCCESS && cb >= 1 && (blob[0] & 1) != 0;
+}
+bool TargetMissing(const std::wstring& path, bool* missing, std::string* err) {
+    *missing = false;
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+    const DWORD code = GetLastError();
+    if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) {
+        *missing = true;
+        return true;
+    }
+    return Fail("checking the existing shortcut target", HRESULT_FROM_WIN32(code), err);
+}
+bool RemoveLegacy(std::string* err) {
+    const LSTATUS st = RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, kValue);
+    if (st == ERROR_SUCCESS || st == ERROR_FILE_NOT_FOUND || st == ERROR_PATH_NOT_FOUND) return true;
+    return Fail("removing the legacy Run entry", HRESULT_FROM_WIN32(st), err);
+}
+bool LoadShortcut(const std::wstring& path, std::wstring* target, std::string* err) {
+    ComPtr<IShellLinkW> link;
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link));
+    ComPtr<IPersistFile> file;
+    if (SUCCEEDED(hr)) hr = link.As(&file);
+    if (SUCCEEDED(hr)) hr = file->Load(path.c_str(), STGM_READ);
+    wchar_t buf[32768]{};
+    if (SUCCEEDED(hr)) hr = link->GetPath(buf, static_cast<int>(std::size(buf)), nullptr, SLGP_RAWPATH);
+    if (FAILED(hr)) return Fail("reading the Startup shortcut", hr, err);
+    *target = buf;
+    return !target->empty() || Fail("reading the shortcut target", E_FAIL, err);
+}
+bool SaveShortcut(const std::wstring& path, const std::wstring& target, std::string* err) {
+    if (target.empty()) return Fail("reading this executable's path", E_FAIL, err);
+    ComPtr<IShellLinkW> link;
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link));
+    if (SUCCEEDED(hr)) hr = link->SetPath(target.c_str());
+    if (SUCCEEDED(hr)) hr = link->SetArguments(L"");
+    const size_t slash = target.find_last_of(L"\\/");
+    if (SUCCEEDED(hr) && slash != std::wstring::npos)
+        hr = link->SetWorkingDirectory(target.substr(0, slash).c_str());
+    if (SUCCEEDED(hr)) hr = link->SetIconLocation(target.c_str(), 0);
+    if (SUCCEEDED(hr)) hr = link->SetDescription(L"Nova SilkPlay");
+    ComPtr<IPersistFile> file;
+    if (SUCCEEDED(hr)) hr = link.As(&file);
+    if (FAILED(hr)) return Fail("creating the Startup shortcut", hr, err);
+    // Stage outside Startup: Windows may open any file left there at sign-in.
+    // The parent normally shares its volume, preserving atomic replacement.
+    const std::wstring dir = path.substr(0, path.find_last_of(L"\\/"));
+    const std::wstring stagingDir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
+    wchar_t tmp[MAX_PATH]{};
+    if (!GetTempFileNameW(stagingDir.c_str(), L"nsp", 0, tmp))
+        return Fail("creating a temporary shortcut", HRESULT_FROM_WIN32(GetLastError()), err);
+    hr = file->Save(tmp, TRUE);
+    if (SUCCEEDED(hr) && !MoveFileExW(tmp, path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        hr = HRESULT_FROM_WIN32(GetLastError());
+    if (FAILED(hr)) {
+        if (!DeleteFileW(tmp) && GetLastError() != ERROR_FILE_NOT_FOUND)
+            LogErr("autostart: temporary shortcut cleanup failed (%lu)", GetLastError());
+        return Fail("saving the Startup shortcut", hr, err);
+    }
+    return true;
+}
 }  // namespace
 
 AutostartState AutostartQuery() {
-    if (ReadRunValue().empty()) return AutostartState::kOff;
-
-    // Task Manager > Startup apps records its own enable bit here. The encoding
-    // is not documented but is stable and well observed: 0x02 enabled, 0x03
-    // disabled, and 0x06/0x07 the same pair after a reboot — the low bit is the
-    // "disabled" flag. Anything we do not recognise, and a missing value (the
-    // state before Task Manager has ever touched the entry), counts as enabled,
-    // which is what the shell will actually do.
-    BYTE blob[64] = {};
-    DWORD cb = sizeof(blob);
-    const LSTATUS st =
-        RegGetValueW(HKEY_CURRENT_USER, kApprovedKey, kValue, RRF_RT_REG_BINARY, nullptr, blob, &cb);
-    if (st == ERROR_SUCCESS && cb >= 1 && (blob[0] & 1) != 0) return AutostartState::kBlocked;
-    return AutostartState::kOn;
-}
-
-bool AutostartSet(bool on, std::string* err) {
-    if (on) {
-        const std::wstring cmd = SelfCommand();
-        if (cmd.empty()) {
-            if (err) *err = "autostart: this executable's own path could not be read";
-            return false;
-        }
-        HKEY key = nullptr;
-        LSTATUS st = RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE,
-                                     nullptr, &key, nullptr);
-        if (st != ERROR_SUCCESS) {
-            if (err) *err = StatusText("opening the Run key", st);
-            return false;
-        }
-        st = RegSetValueExW(key, kValue, 0, REG_SZ,
-                            reinterpret_cast<const BYTE*>(cmd.c_str()),
-                            static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t)));
-        RegCloseKey(key);
-        if (st != ERROR_SUCCESS) {
-            if (err) *err = StatusText("writing the Run value", st);
-            return false;
-        }
-        Log("autostart: ON - %s", Narrow(cmd).c_str());
-        return true;
-    }
-
-    const LSTATUS st = RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, kValue);
-    if (st != ERROR_SUCCESS && st != ERROR_FILE_NOT_FOUND) {
-        if (err) *err = StatusText("deleting the Run value", st);
-        return false;
-    }
-    Log("autostart: OFF");
-    return true;
-}
-
-bool AutostartRepair() {
-    const std::wstring have = ReadRunValue();
-    if (have.empty()) return true;  // not registered: nothing to repair, and we never add one
-    const std::wstring want = SelfCommand();
-    if (want.empty() || _wcsicmp(have.c_str(), want.c_str()) == 0) return true;
-
-    // ONLY WHEN THE OLD TARGET IS GONE. "The path differs" is true of every copy
-    // of this program - a build in the repository, an unpacked zip, a copy run
-    // once out of curiosity - and repairing on that alone silently pointed the
-    // user's autostart at whichever copy ran last, then the installed one pointed
-    // it back, and the two fought over the key (review, 2026-09-20). A
-    // reinstall into another folder leaves the old path NOT EXISTING, which is
-    // the case this exists for and the only one it acts on.
-    std::wstring old = have;
-    if (!old.empty() && old.front() == L'"') {
-        const size_t end = old.find(L'"', 1);
-        old = end == std::wstring::npos ? old.substr(1) : old.substr(1, end - 1);
-    }
-    if (GetFileAttributesW(old.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+    std::wstring path;
     std::string err;
-    if (!AutostartSet(true, &err)) {
-        LogErr("%s", err.c_str());
-        return false;
+    if (!ShortcutPath(&path, &err)) { LogErr("%s", err.c_str()); return AutostartState::kOff; }
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        std::wstring target;
+        if (!LoadShortcut(path, &target, &err)) {
+            LogErr("%s", err.c_str());
+            return AutostartState::kOff;
+        }
+        return Blocked(kApprovedFolder, kShortcut) ? AutostartState::kBlocked : AutostartState::kOn;
     }
-    Log("autostart: the Run value named %s and was repaired to this executable",
-        Narrow(have).c_str());
+    if (ReadRunValue().empty()) return AutostartState::kOff;
+    return Blocked(kApprovedRun, kValue) ? AutostartState::kBlocked : AutostartState::kOn;
+}
+bool AutostartSet(bool on, std::string* err) {
+    std::wstring path;
+    if (!ShortcutPath(&path, err)) return false;
+    if (on) {
+        if (!SaveShortcut(path, SelfPath(), err)) return false;
+    } else if (!DeleteFileW(path.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND &&
+               GetLastError() != ERROR_PATH_NOT_FOUND) {
+        return Fail("deleting the Startup shortcut", HRESULT_FROM_WIN32(GetLastError()), err);
+    }
+    if (!RemoveLegacy(err)) return false;
+    Log("autostart: %s - %s", on ? "ON" : "OFF", Narrow(path).c_str());
     return true;
 }
-
+bool AutostartRepair() {
+    std::wstring path;
+    std::string err;
+    if (!ShortcutPath(&path, &err)) { LogErr("%s", err.c_str()); return false; }
+    const std::wstring legacy = ReadRunValue();
+    std::wstring target;
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (!LoadShortcut(path, &target, &err)) { LogErr("%s", err.c_str()); return false; }
+        // A development build must never steal an installed copy's working shortcut.
+        bool missing = false;
+        if (!TargetMissing(target, &missing, &err)) { LogErr("%s", err.c_str()); return false; }
+        if (missing &&
+            !SaveShortcut(path, SelfPath(), &err)) { LogErr("%s", err.c_str()); return false; }
+    } else {
+        if (legacy.empty()) return true;  // running the app is never consent to autostart
+        // Migration must not silently undo a Task Manager disable.
+        if (Blocked(kApprovedRun, kValue)) return true;
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(legacy.c_str(), &argc);
+        if (argv && argc == 1) target = argv[0];
+        if (argv) LocalFree(argv);
+        if (target.empty()) {
+            LogErr("autostart: cannot migrate a legacy Run command with arguments");
+            return false;
+        }
+        bool missing = false;
+        if (!TargetMissing(target, &missing, &err)) { LogErr("%s", err.c_str()); return false; }
+        if (missing) target = SelfPath();
+        if (!SaveShortcut(path, target, &err)) { LogErr("%s", err.c_str()); return false; }
+    }
+    if (!legacy.empty() && !RemoveLegacy(&err)) { LogErr("%s", err.c_str()); return false; }
+    return true;
+}
 }  // namespace nsp

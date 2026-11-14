@@ -13,6 +13,7 @@ Safe to run unattended.
 """
 import argparse
 import ast
+import bisect
 import csv
 import ctypes
 import ctypes.wintypes as wt
@@ -52,6 +53,12 @@ kernel32.OpenEventW.restype = wt.HANDLE
 kernel32.OpenEventW.argtypes = [wt.DWORD, wt.BOOL, wt.LPCWSTR]
 kernel32.SetEvent.argtypes = [wt.HANDLE]
 kernel32.CloseHandle.argtypes = [wt.HANDLE]
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.GetProcessHandleCount.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+kernel32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+kernel32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+user32.GetGuiResources.argtypes = [wt.HANDLE, wt.DWORD]
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -98,6 +105,11 @@ class THREADENTRY32(ctypes.Structure):
         ("tpDeltaPri", wt.LONG),
         ("dwFlags", wt.DWORD),
     ]
+
+
+psapi.GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX), wt.DWORD]
+kernel32.Thread32First.argtypes = [wt.HANDLE, ctypes.POINTER(THREADENTRY32)]
+kernel32.Thread32Next.argtypes = [wt.HANDLE, ctypes.POINTER(THREADENTRY32)]
 
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
@@ -188,7 +200,7 @@ def get_gui_resources(pid, flags):
 def get_thread_count(pid):
     """Count threads for this process."""
     h = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
-    if h == INVALID_HANDLE_VALUE:
+    if h == ctypes.c_void_p(INVALID_HANDLE_VALUE).value:
         return None
     try:
         te = THREADENTRY32()
@@ -253,6 +265,30 @@ def scan_log_for_errors(log_path, last_pos):
     return new_pos, error_dict, excerpts
 
 
+def engine_activity(text):
+    rates = [float(rate) for rate in re.findall(r"\| out ([\d.]+) fps \|[^\n]*\| SHOWN", text)]
+    return {"overlay_shown": text.count("overlay shown"),
+            "active_stats": sum(rate > 0 for rate in rates)}
+
+
+def settled_samples(samples, text, settle_seconds=2.0):
+    """Compare live pipelines; teardown/scout dips can hide a per-engagement leak."""
+    events = []
+    for stamp, message in re.findall(r"^\[\s*([\d.]+)\]\s*(.*)$", text, re.MULTILINE):
+        if message.startswith("engaged, mode="):
+            events.append((float(stamp) / 1000, True))
+        elif message == "pipeline disengaged" or "looking for the video" in message:
+            events.append((float(stamp) / 1000, False))
+    events.sort()
+    times = [t for t, active in events]
+    result = []
+    for t, value in samples:
+        index = bisect.bisect_right(times, t) - 1
+        if index >= 0 and events[index][1] and t - times[index] >= settle_seconds:
+            result.append((t, value))
+    return result
+
+
 def compute_growth_per_hour(samples, drop_first_60s=True):
     """Compute least-squares slope over samples, scaled to per-hour.
 
@@ -264,7 +300,7 @@ def compute_growth_per_hour(samples, drop_first_60s=True):
 
     # Drop first 60 seconds (warm-up)
     if drop_first_60s and samples:
-        cutoff_time = samples[0][0] + 60
+        cutoff_time = 60
         samples_after = [(t, v) for t, v in samples if t >= cutoff_time]
         if len(samples_after) < 3:
             # Not enough samples; use all
@@ -320,6 +356,8 @@ def main():
     ap.add_argument("--engine-arg", action="append", default=[],
                     help="extra engine arguments (repeatable)")
     args = ap.parse_args()
+    if args.minutes <= 0 or args.sample_seconds <= 0:
+        ap.error("--minutes and --sample-seconds must be positive")
 
     os.makedirs(args.out, exist_ok=True)
 
@@ -376,6 +414,7 @@ def main():
     print("Launching engine...")
     cmd = [
         os.path.join(PROTO, "silkplay.exe"),
+        "--default-settings", "--stats-every", "2",
         "--target-title", args.target_title,
     ] + (["--scout-always"] if args.windowed_auto else ["--allow-windowed"])
     cmd.extend(args.engine_arg)
@@ -472,6 +511,7 @@ def main():
                     log_size,
                 ])
                 samples_written += 1
+                csv_f.flush()
 
                 if ws is not None:
                     samples["working_set_mb"].append((t, ws))
@@ -512,8 +552,8 @@ def main():
             kernel32.CloseHandle(h)
         else:
             print("quit event not found - falling back to terminate()")
-    except Exception:
-        pass
+    except OSError as exc:
+        print(f"could not signal the engine quit event: {exc}")
     time.sleep(5)
     if proc.poll() is None:
         proc.terminate()
@@ -523,7 +563,7 @@ def main():
     proc.wait()
 
     # Phase 5: close test page window
-    hwnd = find_window(args.target_title)
+    hwnd = find_window(args.target_title) if not args.no_page else None
     if hwnd:
         user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
         time.sleep(1)
@@ -540,16 +580,34 @@ def main():
             "Where-Object { $_.CommandLine -like '*nsp-proto-profile*' } | "
             "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
         )
-        subprocess.run(
+        result = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
             capture_output=True, text=True, timeout=30,
-        )
+        ) if not args.no_page else None
+        if result is not None and result.returncode != 0:
+            print(f"could not sweep the test Chrome: {result.stderr.strip()}")
     except Exception as exc:
         print(f"could not sweep the test Chrome: {exc}")
 
     # Phase 6: compute metrics and verdict
     failures = []
     elapsed = (time.time() - (deadline - args.minutes * 60)) / 60
+    log_pos, new_errors, new_excerpts = scan_log_for_errors(log_path, log_pos)
+    for pattern, count in new_errors.items():
+        error_dict[pattern] = error_dict.get(pattern, 0) + count
+    error_excerpts = (error_excerpts + new_excerpts)[:20]
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        engine_text = f.read()
+    activity = engine_activity(engine_text)
+    samples = {name: settled_samples(values, engine_text) for name, values in samples.items()}
+    activity["required_active_stats"] = max(1, int(args.minutes * 60 / 2 * 0.5))
+    if not activity["overlay_shown"] or activity["active_stats"] < activity["required_active_stats"]:
+        failures.append("Insufficient active generation (nonzero output required for at least half the run)")
+    for name, metric_samples in samples.items():
+        if len(metric_samples) < 3:
+            failures.append(f"Insufficient {name} measurements (need at least 3)")
+    if proc.returncode != 0:
+        failures.append(f"Engine exit code {proc.returncode}")
 
     # Check for errors in log
     if error_dict and any(error_dict.values()):
@@ -603,6 +661,9 @@ def main():
         "minutes": elapsed,
         "exit_code": proc.returncode if proc.returncode is not None else 0,
         "samples": samples_written,
+        "metric_basis": "engaged pipeline, at least 2 seconds after engagement",
+        "metric_samples": {name: len(values) for name, values in samples.items()},
+        "activity": activity,
         "working_set_mb": ws_metric,
         "private_bytes_mb": private_metric,
         "handles": handles_metric,

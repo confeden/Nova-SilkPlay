@@ -1,4 +1,4 @@
-"""Run one engine configuration across every analytic scene and print one matrix.
+"""Run one engine configuration across analytic and real-content scenes.
 
 Why this exists. P14 (the occlusion decision rule) and the period lock found on
 A4 are both changes to the same shader, and both are the kind of change that
@@ -37,6 +37,10 @@ The scene set and what each one is FOR:
 A3 and A4 together are the pair that matters: A3's background is static and A4's
 moves, so any rule that quietly assumes a static background wins one and loses
 the other. That is the specific overfit this file exists to catch.
+
+By default the same arms are also scored against real-content corpora with
+sparse-edge metrics. Each clip remains its own row and is never pooled with
+another clip.
 """
 import argparse
 import json
@@ -44,6 +48,8 @@ import os
 import re
 import subprocess
 import sys
+
+from warp_lab import score_gate_corpus
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -111,6 +117,15 @@ def main():
     ap.add_argument("--against", default=None, help="tag of a previous gate run to diff against")
     ap.add_argument("--runs", default="runs/gate")
     ap.add_argument("--scenes", default=None, help="comma-separated subset, e.g. A3,A4")
+    ap.add_argument("--real-corpus", action="append", default=None,
+                    help="real-content PNG corpus; repeat to add clips (default: R3 corpus)")
+    ap.add_argument("--real-stride", type=int, default=2,
+                    help="even frame stride; withheld midpoint frames are ground truth")
+    ap.add_argument("--real-count", type=int, default=32,
+                    help="number of decimated input frames from the real corpus")
+    ap.add_argument("--real-big", type=int, default=40,
+                    help="per-channel error threshold for a large-error pixel")
+    ap.add_argument("--no-real", action="store_true", help="skip the real-content matrix")
     args = ap.parse_args()
 
     want = set(args.scenes.split(",")) if args.scenes else None
@@ -127,11 +142,13 @@ def main():
             results[scene] = got
 
     base = None
+    base_doc = None
     if args.against:
         bp = os.path.join(HERE, args.runs, args.against, "gate.json")
         if os.path.exists(bp):
             with open(bp, encoding="utf-8") as f:
-                base = json.load(f)["results"]
+                base_doc = json.load(f)
+                base = base_doc["results"]
         else:
             print(f"\n!! no baseline at {bp}; printing absolute numbers only")
 
@@ -160,9 +177,47 @@ def main():
                 cells.append("%18s" % (f"{v:7.2f} {d:+6.2f}" if d is not None else f"{v:7.2f}       "))
             print("%-24s %s" % (arm, "".join(cells)))
 
+    real_content = {}
+    if not args.no_real:
+        corpora = args.real_corpus or ["corpus/R3_bbb60_720crop"]
+        baseline_clips = (base_doc or {}).get("real_content", {})
+        for corpus_arg in corpora:
+            real_corpus = corpus_arg if os.path.isabs(corpus_arg) else os.path.join(HERE, corpus_arg)
+            print(f"\nscoring real content {os.path.basename(real_corpus)} ...", flush=True)
+            try:
+                clip = score_gate_corpus(
+                    real_corpus, arms,
+                    os.path.join(run_root, "real_content", os.path.basename(os.path.normpath(real_corpus))),
+                    stride=args.real_stride, count=args.real_count, big=args.real_big,
+                )
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"\n!! real-content scoring FAILED for {real_corpus}: {exc}", file=sys.stderr)
+                return 2
+            if clip["corpus"] in real_content:
+                print(f"\n!! duplicate real-content corpus name: {clip['corpus']}", file=sys.stderr)
+                return 2
+            real_content[clip["corpus"]] = clip
+            base_arms = baseline_clips.get(clip["corpus"], {}).get("arms", {})
+            print("\n=== REAL CONTENT (per clip; no cross-clip pooling) ===")
+            print(f"{clip['corpus']} stride={clip['stride']} pairs={clip['pairs']}")
+            print("%-28s %10s %12s %13s %13s" % (
+                "arm", "PSNR dB", "big px %", "spur edge", "spur >24 %"))
+            for arm in arms:
+                current = clip["arms"][arm]
+                prior = base_arms.get(arm)
+                cells = []
+                for key, fmt in (("psnr_db", ".2f"), ("big_error_px_pct", ".4f"),
+                                 ("spurious_edge_mean", ".3f"), ("spurious_edge_gt24_pct", ".4f")):
+                    value = current[key]
+                    delta = value - prior[key] if prior and key in prior else None
+                    cells.append(f"{value:{fmt}}" + (f" ({delta:+{fmt}})" if delta is not None else ""))
+                print("%-28s %10s %12s %13s %13s" % (arm, *cells))
+
     out = os.path.join(run_root, "gate.json")
     with open(out, "w", encoding="utf-8") as f:
-        json.dump({"tag": args.tag, "arms": arms, "results": results}, f, indent=2)
+        json.dump({"tag": args.tag, "arms": arms, "results": results,
+                   "real_content": real_content},
+                  f, indent=2)
     print(f"\nwrote {out}")
 
     # A missing scene is a failed gate run, not a passed one.

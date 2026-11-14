@@ -23,40 +23,89 @@
 <header><b>NSP windowed page</b>&nbsp;&nbsp;<input placeholder="search" style="width:300px"></header>
 <div id="stage">
   <canvas id="glow" width="96" height="40"></canvas>
-  <video id="v" muted playsinline></video>
+  <video id="v" muted loop playsinline></video>
   <button class="ytp-size-button" onclick="document.getElementById('stage').classList.toggle('theater')">theater</button>
 </div>
 <div id="text"></div>
 <script>
-// A deterministic 24 fps source: a canvas drawn on a fixed media clock, played through a
-// <video> via captureStream, so Chrome composites it the way it composites real video.
+// Default CFR WebM source is fixed-timestamp video. `source=canvas` retains the
+// older RAF-paced capture source for diagnosing source-side cadence problems.
 const q = new URLSearchParams(location.search);
 const fps = +(q.get('fps') || 24);
+const cfr = q.get('source') === 'cfr';
 if (q.get('dark') === '1') document.body.classList.add('dark');
 if (q.get('glow') === '1') document.body.classList.add('glow');
 const src = document.createElement('canvas');
 src.width = 960; src.height = 400;
 const g = src.getContext('2d');
-let n = 0;
-function draw() {
-  const t = n / fps;
+const sourceStream = src.captureStream(0);
+const sourceTrack = sourceStream.getVideoTracks()[0];
+let n = -1;
+let startedAt = null;
+let lastDrawAt = null;
+const drawIntervals = [];
+const presentedIntervals = [];
+const mediaIntervals = [];
+let lastPresentedAt = null;
+let lastMediaTime = null;
+function draw(frame) {
+  const t = frame / fps;
   g.fillStyle = '#203040'; g.fillRect(0, 0, 960, 400);
   for (let i = 0; i < 12; i++) {
-    g.fillStyle = `hsl(${(i * 30 + n) % 360},70%,55%)`;
+    g.fillStyle = `hsl(${i * 30},70%,55%)`;
     const x = (i * 97 + t * 240) % 1100 - 70, y = 30 + i * 28;
     g.fillRect(x, y, 70, 22);
   }
-  g.fillStyle = '#fff'; g.font = '28px monospace'; g.fillText('frame ' + n, 20, 380);
-  n++;
+  g.fillStyle = '#fff'; g.font = '28px monospace'; g.fillText('CFR SOURCE TEST', 20, 380);
 }
-draw();
-setInterval(draw, 1000 / fps);
+function animate(now) {
+  if (startedAt === null) startedAt = now;
+  const frame = Math.floor((now - startedAt) * fps / 1000);
+  if (frame > n) {
+    if (lastDrawAt !== null) {
+      drawIntervals.push(now - lastDrawAt);
+      if (drawIntervals.length > 120) drawIntervals.shift();
+    }
+    lastDrawAt = now;
+    n = frame;
+    draw(frame);
+    sourceTrack.requestFrame();
+  }
+  requestAnimationFrame(animate);
+}
+function summarize(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const at = p => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] : 0;
+  const mean = sorted.length ? sorted.reduce((sum, x) => sum + x, 0) / sorted.length : 0;
+  return {samples: sorted.length,
+          min_ms: +(at(0).toFixed(2)), mean_ms: +(mean.toFixed(2)), median_ms: +(at(.5).toFixed(2)),
+          p95_ms: +(at(.95).toFixed(2)), max_ms: +(at(1).toFixed(2))};
+}
+window.__nspSourceStats = () => ({fps, source: cfr ? 'cfr-webm' : 'canvas',
+  callback_intervals: summarize(cfr ? presentedIntervals : drawIntervals),
+  ...(cfr ? {media_intervals: summarize(mediaIntervals)} : {})});
+if (!cfr) requestAnimationFrame(animate);
 const v = document.getElementById('v');
-v.srcObject = src.captureStream(fps);
+if (cfr) {
+  v.src = `generated/cfr_${fps}.webm`;
+  const onFrame = (_now, meta) => {
+    if (lastPresentedAt !== null) presentedIntervals.push(meta.expectedDisplayTime - lastPresentedAt);
+    if (lastMediaTime !== null && meta.mediaTime > lastMediaTime)
+      mediaIntervals.push((meta.mediaTime - lastMediaTime) * 1000);
+    lastPresentedAt = meta.expectedDisplayTime;
+    lastMediaTime = meta.mediaTime;
+    if (presentedIntervals.length > 120) presentedIntervals.shift();
+    if (mediaIntervals.length > 120) mediaIntervals.shift();
+    v.requestVideoFrameCallback(onFrame);
+  };
+  v.addEventListener('loadeddata', () => v.requestVideoFrameCallback(onFrame), {once: true});
+} else {
+  v.srcObject = sourceStream;
+}
 v.play();
 // The ambient-mode stand-in: a blurred, enlarged copy of the picture, repainted at 12 Hz.
 const glow = document.getElementById('glow').getContext('2d');
-setInterval(() => { if (document.body.classList.contains('glow')) glow.drawImage(src, 0, 0, 96, 40); }, 1000 / 12);
+setInterval(() => { if (document.body.classList.contains('glow')) glow.drawImage(cfr ? v : src, 0, 0, 96, 40); }, 1000 / 12);
 let text = '';
 for (let i = 0; i < 40; i++) text += `<p>Paragraph ${i}. Static page text below the video, so the page scrolls.</p>`;
 document.getElementById('text').innerHTML = text;

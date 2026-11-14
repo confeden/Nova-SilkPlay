@@ -849,6 +849,8 @@ void CSFieldCohere(uint3 id : SV_DispatchThreadID) {
     float2 best = mvIn[id.xy];
     float bestE = 1e30;
     [loop] for (int k = 0; k < n; ++k) {
+        // Preserve the first tie winner without rescoring equal adjacent vectors.
+        if (gMcPad2.y > 0.5 && k > 0 && all(nb[k] == nb[max(k - 1, 0)])) continue;
         float e = 0.0;
         if (gMagPrior > 0.5) e += CohereScore(centreLvl, nb[k] / gLevelScale, invSize);
         float sm = 0.0;
@@ -859,16 +861,62 @@ void CSFieldCohere(uint3 id : SV_DispatchThreadID) {
         e += gLambda * sm / float(n);
         if (e < bestE) { bestE = e; best = nb[k]; }
     }
+    // Visibility fields must not smooth away a correctly matched silhouette.
+    // Only replace their vector when the photometric evidence also improves.
+    if (gMcPad2.x > 0.5 &&
+        CohereScore(centreLvl, best / gLevelScale, invSize) >=
+        0.92 * CohereScore(centreLvl, mvIn[id.xy] / gLevelScale, invSize))
+        best = mvIn[id.xy];
+    mvOut[id.xy] = best;
+}
+
+// Visibility-only specialization: the final photometric guard is exact, so a
+// zero-error source vector cannot be replaced by any nonnegative candidate.
+[numthreads(8, 8, 1)]
+void CSFieldVisibility(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= gGrid.x || id.y >= gGrid.y) return;
+    float2 centreLvl = ((float2(id.xy) + 0.5) * gCellPx) / gLevelScale;
+    float2 invSize = 1.0 / float2(gLevelSize);
+    float2 own = mvIn[id.xy];
+    float ownData = CohereScore(centreLvl, own / gLevelScale, invSize);
+    if (ownData == 0.0) { mvOut[id.xy] = own; return; }
+    int R = gMcPad > 1.5 ? 2 : 1;
+    float2 nb[25];
+    int n = 0;
+    [loop] for (int dy = -2; dy <= 2; ++dy) {
+        [loop] for (int dx = -2; dx <= 2; ++dx) {
+            if (abs(dx) > R || abs(dy) > R) continue;
+            int2 q = clamp(int2(id.xy) + int2(dx, dy), int2(0, 0), int2(gGrid) - 1);
+            nb[n++] = mvIn[q];
+        }
+    }
+    float2 best = own;
+    float bestE = 1e30, bestData = ownData;
+    [loop] for (int k = 0; k < n; ++k) {
+        if (k > 0 && all(nb[k] == nb[max(k - 1, 0)])) continue;
+        float data = CohereScore(centreLvl, nb[k] / gLevelScale, invSize);
+        float sm = 0.0;
+        [loop] for (int j = 0; j < n; ++j) {
+            float2 dv = abs(nb[k] - nb[j]);
+            sm += min(dv.x + dv.y, gMagCap);
+        }
+        float e = data + gLambda * sm / float(n);
+        if (e < bestE) { bestE = e; best = nb[k]; bestData = data; }
+    }
+    if (bestData >= 0.92 * ownData) best = own;
     mvOut[id.xy] = best;
 }
 
 // ------------------------------------------------------------ scene cuts (P23)
-// Per cell, how badly the two frames still disagree along the FINAL field: the mean
-// |dLuma| over 3x3 taps on the /2 luma (the sqrt-luma every matcher here scores).
-// gMcPad < 0.5 writes a 0..1 mismatch indicator ramping from gLambda to gMagCap, whose
-// mip chain's top level is the share of cells that disagree; gMcPad > 0.5 writes the
-// raw residual, for calibration only.
-RWTexture2D<float> cutOut : register(u0);
+// Per cell, how badly the two frames still disagree (the mean |dLuma| over 3x3 taps on the
+// /2 luma, the sqrt-luma every matcher here scores): r along the FINAL field, g with no
+// motion at all. Their whole-picture ratio estimates how much difference motion explains.
+// Across a cut the midpoint samples can falsely agree in letterbox; the independent
+// round-trip check below guards that case. The means are integer sums: GenerateMips drops rows
+// of an odd-sized grid, enough to turn a local flash into a false decision.
+static const float kCutSumScale = 1024.0;
+RWTexture2D<float2> cutOut : register(u0);
+RWByteAddressBuffer cutSumOut : register(u1);
 
 [numthreads(8, 8, 1)]
 void CSCutResidual(uint3 id : SV_DispatchThreadID) {
@@ -877,16 +925,56 @@ void CSCutResidual(uint3 id : SV_DispatchThreadID) {
     float2 invSize = 1.0 / float2(gLevelSize);
     float2 vLvl = mvIn[id.xy] / gLevelScale;
     float sad = 0.0;
+    float sadStill = 0.0;
     [unroll] for (int wy = -1; wy <= 1; ++wy) {
         [unroll] for (int wx = -1; wx <= 1; ++wx) {
             float2 o = float2(wx, wy) * 1.5;
             float a = lumaA.SampleLevel(smpLin, (centreLvl + o - vLvl * 0.5 + 0.5) * invSize, 0);
             float b = lumaB.SampleLevel(smpLin, (centreLvl + o + vLvl * 0.5 + 0.5) * invSize, 0);
             sad += abs(a - b);
+            sadStill += abs(lumaA.SampleLevel(smpLin, (centreLvl + o + 0.5) * invSize, 0) -
+                            lumaB.SampleLevel(smpLin, (centreLvl + o + 0.5) * invSize, 0));
         }
     }
-    float r = sad / 9.0;
-    cutOut[id.xy] = gMcPad > 0.5 ? r : saturate((r - gLambda) / max(gMagCap - gLambda, 1e-4));
+    float2 residual = float2(sad, sadStill) / 9.0;
+    [branch] if (gUseIn == 2) {
+        float2 uv = (centreLvl + 0.5) * invSize;
+        float2 fwd = mvATex.SampleLevel(smpLin, uv, 0) / gLevelScale;
+        float2 bwd = mvBTex.SampleLevel(smpLin, uv, 0) / gLevelScale;
+        float anchored = 0.0;
+        [unroll] for (int ay = -1; ay <= 1; ++ay) {
+            [unroll] for (int ax = -1; ax <= 1; ++ax) {
+                float2 p = centreLvl + float2(ax, ay) * 1.5 + 0.5;
+                float a = lumaA.SampleLevel(smpLin, p * invSize, 0);
+                float b = lumaB.SampleLevel(smpLin, p * invSize, 0);
+                anchored += 0.5 * (abs(a - lumaB.SampleLevel(smpLin, (p + fwd) * invSize, 0)) +
+                                  abs(lumaA.SampleLevel(smpLin, (p - bwd) * invSize, 0) - b));
+            }
+        }
+        residual.x = max(residual.x, anchored / 9.0);
+    }
+    cutOut[id.xy] = residual;
+    uint unused;
+    cutSumOut.InterlockedAdd(0, uint(residual.x * kCutSumScale + 0.5), unused);
+    cutSumOut.InterlockedAdd(4, uint(residual.y * kCutSumScale + 0.5), unused);
+    // A midpoint warp can send both samples into letterbox on a hard cut.
+    // Independently count changed luma without a source-to-source round trip.
+    float unmatched = 0.0;
+    if (gUseIn != 0) {
+        float2 uv = (centreLvl + 0.5) * invSize;
+        float2 fwd = mvATex.SampleLevel(smpLin, uv, 0) / gLevelScale;
+        float2 bwd = mvBTex.SampleLevel(smpLin, uv, 0) / gLevelScale;
+        float2 qB = uv + fwd * invSize, qA = uv - bwd * invSize;
+        float2 backAtB = mvBTex.SampleLevel(smpLin, qB, 0) / gLevelScale;
+        float2 fwdAtA = mvATex.SampleLevel(smpLin, qA, 0) / gLevelScale;
+        bool validA = all(qA >= 0.0) && all(qA <= 1.0);
+        bool validB = all(qB >= 0.0) && all(qB <= 1.0);
+        // One full-resolution pixel plus 5% of displacement.
+        bool consistentA = validB && length(fwd - backAtB) <= 0.5 + 0.05 * max(length(fwd), length(backAtB));
+        bool consistentB = validA && length(bwd - fwdAtA) <= 0.5 + 0.05 * max(length(bwd), length(fwdAtA));
+        unmatched = residual.y * 0.5 * ((consistentA ? 0.0 : 1.0) + (consistentB ? 0.0 : 1.0));
+    }
+    cutSumOut.InterlockedAdd(8, uint(unmatched * kCutSumScale + 0.5), unused);
 }
 
 // The histogram half of the cut decision. A cut changes what the picture is made of; a
@@ -898,6 +986,9 @@ RWTexture2D<float4> histOut0 : register(u0);
 RWTexture2D<float4> histOut1 : register(u1);
 RWTexture2D<float4> histOut2 : register(u2);
 RWTexture2D<float4> histOut3 : register(u3);
+// The same tone differences, separated into four spatial quadrants. Each
+// quadrant owns four array slices (one per four-bin group).
+RWTexture2DArray<float4> histSpatialOut : register(u4);
 
 float4 OneHot4(int band, int base) {
     return float4(band == base ? 1.0 : 0.0, band == base + 1 ? 1.0 : 0.0,
@@ -915,39 +1006,113 @@ void CSCutHist(uint3 id : SV_DispatchThreadID) {
     float2 uv = ((float2(id.xy) + 0.5) * gCellPx) / float2(gLevelSize);
     int ba = ToneBand(texA.SampleLevel(smpLin, uv, 0).rgb);
     int bb = ToneBand(texB.SampleLevel(smpLin, uv, 0).rgb);
-    histOut0[id.xy] = OneHot4(ba, 0) - OneHot4(bb, 0);
-    histOut1[id.xy] = OneHot4(ba, 4) - OneHot4(bb, 4);
-    histOut2[id.xy] = OneHot4(ba, 8) - OneHot4(bb, 8);
-    histOut3[id.xy] = OneHot4(ba, 12) - OneHot4(bb, 12);
+    float4 d0 = OneHot4(ba, 0) - OneHot4(bb, 0);
+    float4 d1 = OneHot4(ba, 4) - OneHot4(bb, 4);
+    float4 d2 = OneHot4(ba, 8) - OneHot4(bb, 8);
+    float4 d3 = OneHot4(ba, 12) - OneHot4(bb, 12);
+    histOut0[id.xy] = d0;
+    histOut1[id.xy] = d1;
+    histOut2[id.xy] = d2;
+    histOut3[id.xy] = d3;
+
+    int region = (id.x >= gGrid.x / 2 ? 1 : 0) + (id.y >= gGrid.y / 2 ? 2 : 0);
+    [unroll] for (int r = 0; r < 4; ++r) {
+        float4 mask = r == region ? 1.0 : 0.0;
+        uint base = uint(r * 4);
+        histSpatialOut[uint3(id.xy, base + 0)] = d0 * mask;
+        histSpatialOut[uint3(id.xy, base + 1)] = d1 * mask;
+        histSpatialOut[uint3(id.xy, base + 2)] = d2 * mask;
+        histSpatialOut[uint3(id.xy, base + 3)] = d3 * mask;
+    }
+}
+
+// Joint source-colour distance catches cuts between shots with similar gray tones.
+RWByteAddressBuffer colorHistogramOut : register(u0);
+groupshared int colorCounts[512];
+float EncodeChannel(float x) {
+    x = saturate(x);
+    return x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+uint ColorBin(float3 c) {
+    uint3 bins = min(uint3(float3(EncodeChannel(c.r), EncodeChannel(c.g), EncodeChannel(c.b)) * 8.0), 7);
+    return (bins.r * 8 + bins.g) * 8 + bins.b;
+}
+[numthreads(8, 8, 1)]
+void CSColorHistogram(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex) {
+    for (uint k = lane; k < 512; k += 64) colorCounts[k] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (id.x < gGrid.x && id.y < gGrid.y) {
+        float2 uv = ((float2(id.xy) + 0.5) * gCellPx + 0.5) / float2(gLevelSize);
+        InterlockedAdd(colorCounts[ColorBin(texA.SampleLevel(smpLin, uv, 0).rgb)], 1);
+        InterlockedAdd(colorCounts[ColorBin(texB.SampleLevel(smpLin, uv, 0).rgb)], -1);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint bin = lane; bin < 512; bin += 64) {
+        if (colorCounts[bin] != 0) {
+            uint unused;
+            colorHistogramOut.InterlockedAdd(bin * 4, asuint(colorCounts[bin]), unused);
+        }
+    }
 }
 
 // The decision, on the GPU so the warp never waits for a readback. gHintSize.x is the
-// histogram textures' top mip, gHintSize.y the residual indicator's.
-//   r  UNRELIABLE: histogram distance over gLambda..gMagCap, or a residual share over
-//      gMagPrior..gMcPad that only counts when the histogram also moved (fast motion alone
-//      can leave many cells unexplained).
-//   g  HARD CUT: histogram distance over gAnchor..gReanchor. On R4 every real cut was
-//      0.45-0.57; an object sweeping into frame between two 15-fps-apart frames reached
-//      0.37 and is only r.
+// histogram textures' top mip. Calibrated on all of Tears of Steel (17618 pairs, 128 clear
+// cuts) against R2-R4; histograms alone missed cuts between shots of similar tone and held
+// fast pans (G90). Both outputs are 0 or 1: a share of a warp assembled across a cut is
+// still a mosaic.
+//   explained    a tone change that motion explains is motion, not a cut: it gates the
+//                histogram routes. The weakest real cut measured 0.76, fast pans 0.17-0.37.
+//   unexplained  motion explains almost nothing, and the pair differs by more than noise.
+//   hold (g)     unexplained and a sudden jump over the previous pair, which a sustained
+//                flicker is not; or the global or spatial histogram distance.
+//   fade (r)     unexplained, or a smaller histogram distance: nothing to warp, and a ghost
+//                is better than a mosaic.
 Texture2D<float4>   histD0 : register(t10);
 Texture2D<float4>   histD1 : register(t11);
 Texture2D<float4>   histD2 : register(t12);
 Texture2D<float4>   histD3 : register(t13);
-Texture2D<float>    cutGrid : register(t14);
+ByteAddressBuffer   cutSum : register(t14);
+Texture2DArray<float4> histSpatialD : register(t15);
+ByteAddressBuffer   cutPrevious : register(t16);
+ByteAddressBuffer   colorHistogram : register(t17);
 RWTexture2D<float2> cutFinal : register(u0);
 
 [numthreads(1, 1, 1)]
 void CSCutDecide(uint3 id : SV_DispatchThreadID) {
     int hm = (int)gHintSize.x;
-    int rm = (int)gHintSize.y;
     float4 one = float4(1.0, 1.0, 1.0, 1.0);
     float hist = 0.5 * (dot(abs(histD0.Load(int3(0, 0, hm))), one) + dot(abs(histD1.Load(int3(0, 0, hm))), one) +
                         dot(abs(histD2.Load(int3(0, 0, hm))), one) + dot(abs(histD3.Load(int3(0, 0, hm))), one));
-    float res = cutGrid.Load(int3(0, 0, rm));
-    float sHist = saturate((hist - gLambda) / max(gMagCap - gLambda, 1e-4));
-    float sRes = saturate((res - gMagPrior) / max(gMcPad - gMagPrior, 1e-4)) * saturate((hist - 0.12) / 0.08);
-    float sCut = saturate((hist - gAnchor) / max(gReanchor - gAnchor, 1e-4));
-    cutFinal[uint2(0, 0)] = float2(max(sHist, sRes), sCut);
+    float spatial = 0.0;
+    [unroll] for (int slice = 0; slice < 16; ++slice)
+        spatial += dot(abs(histSpatialD.Load(int4(0, 0, slice, hm))), one);
+    spatial *= 0.5;
+    float perCell = 1.0 / (kCutSumScale * float(gGrid.x) * float(gGrid.y));
+    float warped = float(cutSum.Load(0)) * perCell;
+    float still = float(cutSum.Load(4)) * perCell;
+    float previousStill = float(cutPrevious.Load(4)) * perCell;
+    float share = warped / max(still, 1e-5);
+    bool explained = share >= 0.65;
+    bool unexplained = share >= 0.85 && still >= 0.010;
+    bool jump = still >= 2.5 * previousStill;
+    float unmatched = float(cutSum.Load(8)) * perCell;
+    // Occlusion also breaks round trips. Require an abrupt pair AND changed
+    // global/spatial tone proportions, not just tones moving between quadrants.
+    bool bidirCut = unmatched >= 0.85 * max(still, 1e-5) && still >= 0.010 && jump &&
+                    spatial >= gLambda && hist >= 0.5 * gLambda;
+    // The block matcher minimizes this very midpoint residual, so its low
+    // score is not independent evidence against a cut. Without source-side
+    // fields, require an abrupt change and both strong composition signals.
+    bool blockCut = gUseIn != 0 && still >= 0.010 && jump && hist >= gAnchor && spatial >= gLambda;
+    float colorDistance = 0.0;
+    [loop] for (uint bin = 0; bin < 512; ++bin)
+        colorDistance += abs(asint(colorHistogram.Load(bin * 4)));
+    colorDistance *= 0.5 / max(gStepLvl, 1.0);
+    bool colorCut = still >= 0.010 && jump && colorDistance >= gAnchor && spatial >= gLambda;
+    bool holdUnexplained = unexplained && jump && (gUseIn == 0 || hist >= gLambda || spatial >= gLambda);
+    bool hold = colorCut || blockCut || bidirCut || holdUnexplained || (explained && (hist >= gAnchor || spatial >= gMcPad2.x));
+    bool fade = colorCut || blockCut || bidirCut || unexplained || (explained && hist >= gLambda);
+    cutFinal[uint2(0, 0)] = float2(fade ? 1.0 : 0.0, hold ? 1.0 : 0.0);
 }
 )HLSL";
 
@@ -1004,6 +1169,7 @@ struct McCb {
     float pad4[2] = {};
 };
 static_assert(offsetof(McCb, hintW) == 64, "McCb must match the HLSL McParams packing (G54)");
+static_assert(offsetof(McCb, pad4) == 72, "McCb must match gMcPad2 (coherence/cut parameters)");
 
 // COMPILED ONCE PER PROCESS, NOT PER ENGAGE. The HLSL source is a fixed string
 // in this binary, so the bytecode a given entry point compiles to can never
@@ -1129,34 +1295,40 @@ struct Synth::Impl {
     // (--ofa-seed-hints) measured -3.6 dB on A4 and no gain on real footage, so the
     // seed pyramid is not even computed unless asked for.
     bool ofaSeedHints = false;
-    // P23: the per-pair cut statistic. cutTex holds the per-cell indicator with a full
-    // mip chain; cut1 (and heldCut1 for the older pair) the 1x1 share the warp reads.
+    // P23: the per-pair cut statistic. cutTex holds the per-cell residuals for the debug
+    // readout, cutSum their sums and cutPrevious the last pair's; cut1 (and heldCut1 for
+    // the older pair) the 1x1 decision the warp reads.
     ComPtr<ID3D11Texture2D> cutTex, cut1, heldCut1;
-    ComPtr<ID3D11ShaderResourceView> cutSrvAll, cut1Srv, heldCut1Srv;
-    ComPtr<ID3D11UnorderedAccessView> cutUav, cut1Uav;
-    UINT cutTopMip = 0;
+    ComPtr<ID3D11Buffer> cutSum, cutPrevious;
+    ComPtr<ID3D11ShaderResourceView> cut1Srv, heldCut1Srv, cutSumSrv, cutPreviousSrv;
+    ComPtr<ID3D11UnorderedAccessView> cutUav, cutSumUav, cut1Uav;
     // Tone histograms of A minus B, four RGBA16F textures with mip chains (16 bands).
     ComPtr<ID3D11Texture2D> histTex[4];
     ComPtr<ID3D11ShaderResourceView> histSrv[4];
     ComPtr<ID3D11UnorderedAccessView> histUav[4];
+    // Same histograms partitioned by image quadrant, for cuts whose global tone
+    // distribution is unchanged but whose composition differs.
+    ComPtr<ID3D11Texture2D> histSpatialTex;
+    ComPtr<ID3D11ShaderResourceView> histSpatialSrv;
+    ComPtr<ID3D11UnorderedAccessView> histSpatialUav;
+    ComPtr<ID3D11Buffer> colorHistogramBuffer;
+    ComPtr<ID3D11ShaderResourceView> colorHistogramSrv;
+    ComPtr<ID3D11UnorderedAccessView> colorHistogramUav;
     UINT histW = 0, histH = 0, histTopMip = 0;
-    // Residual band that counts a cell as mismatched (mean |d sqrt-luma| per tap).
-    static constexpr float kCutTau0 = 0.06f;
-    static constexpr float kCutTau1 = 0.10f;
-    // Decision ramps (calibrated on R4's four real cuts against R3, R2 and A1-A5):
-    // histogram distance, and the residual share that only counts with some tone change.
-    static constexpr float kCutHist0 = 0.22f;
-    static constexpr float kCutHist1 = 0.30f;
-    static constexpr float kCutRes0 = 0.30f;
-    static constexpr float kCutRes1 = 0.45f;
-    static constexpr float kCutHard0 = 0.40f;
-    static constexpr float kCutHard1 = 0.45f;
-    void RunCutStat(bool raw);
+    // Histogram distances of the decision; the residual's thresholds live in CSCutDecide.
+    static constexpr float kCutFade = 0.30f;
+    static constexpr float kCutHard = 0.45f;
+    // A real moving object scored as high as 0.402 on the 60p Bunny corpus and
+    // 0.333 on Spring; same-tone synthetic cuts score >0.98. Keep a clear gap.
+    static constexpr float kCutSpatialHard = 0.52f;
+    void RunCutStat(bool blockFallback);
     void RunCutHist(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b);
-    void RunCutDecide();
-    void UpdateCut(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b);
+    void RunColorHistogram(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b);
+    void RunCutDecide(bool blockFallback);
+    void UpdateCut(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b, bool blockFallback = false);
     ComPtr<ID3D11Texture2D> flowSyncStaging;
-    void RunCohere(int idx, float anchor, int radius, float lambda, float trunc, bool data, int iters);
+    void RunCohere(int idx, float anchor, int radius, float lambda, float trunc, bool data, int iters,
+                   bool requireDataGain = false);
     void ApplyFieldLab(int idx, float anchor, bool side);
     // DEBUG (env NSP_HASH_FIELDS): short SHA-256 of a texture's contents, via a
     // blocking staging copy. Only for locating run-to-run divergence.
@@ -1172,8 +1344,10 @@ struct Synth::Impl {
     ComPtr<ID3D11ComputeShader> csFillHint;
     ComPtr<ID3D11ComputeShader> csCoarseFix;
     ComPtr<ID3D11ComputeShader> csFieldCohere;
+    ComPtr<ID3D11ComputeShader> csFieldVisibility;
     ComPtr<ID3D11ComputeShader> csCutResidual;
     ComPtr<ID3D11ComputeShader> csCutHist;
+    ComPtr<ID3D11ComputeShader> csColorHistogram;
     ComPtr<ID3D11ComputeShader> csCutDecide;
     OfaFlow ofa;
     bool ofaOn = false;
@@ -1490,14 +1664,20 @@ void Synth::Impl::RunCoarseFixOn(ID3D11ShaderResourceView* in, ID3D11UnorderedAc
 }
 
 void Synth::Impl::RunCohere(int idx, float anchor, int radius, float lambda, float trunc, bool data,
-                            int iters) {
+                            int iters, bool requireDataGain) {
+    static const bool reference = EnvSet("NSP_COHERE_REFERENCE");
     const int scratch = kFieldCount - 1;
     int src = idx;
     ID3D11SamplerState* samplers[2] = {smpPoint.Get(), smpLinear.Get()};
     for (int it = 0; it < iters; ++it) {
         const int dst = (src == idx) ? scratch : idx;
         D3D11_MAPPED_SUBRESOURCE m{};
-        if (SUCCEEDED(ctx->Map(cbMc.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        const HRESULT hr = ctx->Map(cbMc.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
+        if (FAILED(hr)) {
+            LogErr("field coherence: constant buffer map failed (%s)", HrString(hr).c_str());
+            return;
+        }
+        {
             McCb c{};
             c.gridW = gridW;
             c.gridH = gridH;
@@ -1509,6 +1689,8 @@ void Synth::Impl::RunCohere(int idx, float anchor, int radius, float lambda, flo
             c.lambda = lambda;
             c.anchor = anchor;
             c.magPrior = data ? 1.0f : 0.0f;
+            c.pad4[0] = requireDataGain ? 1.0f : 0.0f;
+            c.pad4[1] = !reference ? 1.0f : 0.0f;
             c.magCap = trunc;
             c.pad3 = static_cast<float>(radius);
             memcpy(m.pData, &c, sizeof(c));
@@ -1517,7 +1699,9 @@ void Synth::Impl::RunCohere(int idx, float anchor, int radius, float lambda, flo
         ID3D11ShaderResourceView* srvs[3] = {levels[0].srvA.Get(), levels[0].srvB.Get(), mvSrv[src].Get()};
         ID3D11UnorderedAccessView* uavs[1] = {mvUav[dst].Get()};
         ID3D11Buffer* cbs[1] = {cbMc.Get()};
-        ctx->CSSetShader(csFieldCohere.Get(), nullptr, 0);
+        static const bool visibilityReference = EnvSet("NSP_VISIBILITY_REFERENCE");
+        const bool specialized = requireDataGain && data && !visibilityReference && !reference;
+        ctx->CSSetShader(specialized ? csFieldVisibility.Get() : csFieldCohere.Get(), nullptr, 0);
         ctx->CSSetSamplers(0, 2, samplers);
         ctx->CSSetShaderResources(3, 3, srvs);
         ctx->CSSetConstantBuffers(2, 1, cbs);
@@ -1593,8 +1777,14 @@ std::string Synth::Impl::HashTex(ID3D11Texture2D* tex) {
     return Sha256Hex(buf.data(), buf.size()).substr(0, 12) + extra;
 }
 
-void Synth::Impl::RunCutStat(bool raw) {
-    if (!cutTex || !csCutResidual || mvFinal < 0) return;
+void Synth::Impl::RunCutStat(bool blockFallback) {
+    if (!cutTex || !cutSum || !csCutResidual || mvFinal < 0) return;
+    if (blockFallback) {
+        // These temporary source-anchored fields only score cuts; block warping
+        // keeps its midpoint field and does not enable the NVOFA visibility path.
+        RunFieldFix(mvFinal, 3, 0.0f, -0.5f);
+        RunFieldFix(mvFinal, 4, 1.0f, 0.5f);
+    }
     D3D11_MAPPED_SUBRESOURCE m{};
     if (SUCCEEDED(ctx->Map(cbMc.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         McCb c{};
@@ -1603,33 +1793,36 @@ void Synth::Impl::RunCutStat(bool raw) {
         c.levelW = levels[0].w;
         c.levelH = levels[0].h;
         c.levelScale = 2.0f;
-        c.useIn = 1;
+        c.useIn = mvFwd >= 0 && mvBwd >= 0 ? 1U : 0U;
+        if (blockFallback) c.useIn = 2;
         c.cellPx = static_cast<float>(cellPx);
-        c.lambda = kCutTau0;
-        c.magCap = kCutTau1;
-        c.pad3 = raw ? 1.0f : 0.0f;
         memcpy(m.pData, &c, sizeof(c));
         ctx->Unmap(cbMc.Get(), 0);
     }
     ID3D11SamplerState* samplers[2] = {smpPoint.Get(), smpLinear.Get()};
     ID3D11ShaderResourceView* srvs[3] = {levels[0].srvA.Get(), levels[0].srvB.Get(), mvSrv[mvFinal].Get()};
-    ID3D11UnorderedAccessView* uavs[1] = {cutUav.Get()};
+    const UINT zero[4] = {};
+    ctx->ClearUnorderedAccessViewUint(cutSumUav.Get(), zero);
+    ID3D11UnorderedAccessView* uavs[2] = {cutUav.Get(), cutSumUav.Get()};
     ID3D11Buffer* cbs[1] = {cbMc.Get()};
     ctx->CSSetShader(csCutResidual.Get(), nullptr, 0);
     ctx->CSSetSamplers(0, 2, samplers);
     ctx->CSSetShaderResources(3, 3, srvs);
+    ID3D11ShaderResourceView* sides[2] = {blockFallback ? mvSrv[3].Get() : (mvFwd >= 0 ? mvSrv[mvFwd].Get() : nullptr),
+                                       blockFallback ? mvSrv[4].Get() : (mvBwd >= 0 ? mvSrv[mvBwd].Get() : nullptr)};
+    ctx->CSSetShaderResources(7, 2, sides);
     ctx->CSSetConstantBuffers(2, 1, cbs);
-    ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+    ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
     ctx->Dispatch(DivUp(gridW, 8), DivUp(gridH, 8), 1);
-    ID3D11UnorderedAccessView* noUav[1] = {nullptr};
-    ctx->CSSetUnorderedAccessViews(0, 1, noUav, nullptr);
+    ID3D11UnorderedAccessView* noUav[2] = {};
+    ctx->CSSetUnorderedAccessViews(0, 2, noUav, nullptr);
     ID3D11ShaderResourceView* noSrv[3] = {};
     ctx->CSSetShaderResources(3, 3, noSrv);
-    if (!raw) ctx->GenerateMips(cutSrvAll.Get());
+    ctx->CSSetShaderResources(7, 2, noSrv);
 }
 
 void Synth::Impl::RunCutHist(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b) {
-    if (!histTex[0] || !csCutHist) return;
+    if (!histTex[0] || !histSpatialTex || !csCutHist) return;
     D3D11_MAPPED_SUBRESOURCE m{};
     if (SUCCEEDED(ctx->Map(cbMc.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         McCb c{};
@@ -1643,58 +1836,76 @@ void Synth::Impl::RunCutHist(ID3D11ShaderResourceView* a, ID3D11ShaderResourceVi
     }
     ID3D11SamplerState* samplers[2] = {smpPoint.Get(), smpLinear.Get()};
     ID3D11ShaderResourceView* srcs[2] = {a, b};
-    ID3D11UnorderedAccessView* uavs[4] = {histUav[0].Get(), histUav[1].Get(), histUav[2].Get(), histUav[3].Get()};
+    ID3D11UnorderedAccessView* uavs[5] = {histUav[0].Get(), histUav[1].Get(), histUav[2].Get(), histUav[3].Get(),
+                                         histSpatialUav.Get()};
     ID3D11Buffer* cbs[1] = {cbMc.Get()};
     ctx->CSSetShader(csCutHist.Get(), nullptr, 0);
     ctx->CSSetSamplers(0, 2, samplers);
     ctx->CSSetShaderResources(0, 2, srcs);
     ctx->CSSetConstantBuffers(2, 1, cbs);
-    ctx->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+    ctx->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
     ctx->Dispatch(DivUp(histW, 8), DivUp(histH, 8), 1);
-    ID3D11UnorderedAccessView* noUav[4] = {};
-    ctx->CSSetUnorderedAccessViews(0, 4, noUav, nullptr);
+    ID3D11UnorderedAccessView* noUav[5] = {};
+    ctx->CSSetUnorderedAccessViews(0, 5, noUav, nullptr);
     ID3D11ShaderResourceView* noSrv[2] = {};
     ctx->CSSetShaderResources(0, 2, noSrv);
     for (int i = 0; i < 4; ++i) ctx->GenerateMips(histSrv[i].Get());
+    ctx->GenerateMips(histSpatialSrv.Get());
 }
 
-void Synth::Impl::RunCutDecide() {
-    if (!csCutDecide || !cut1Uav || !histTex[0] || !cutTex) return;
+void Synth::Impl::RunColorHistogram(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b) {
+    const UINT zero[4] = {};
+    ctx->ClearUnorderedAccessViewUint(colorHistogramUav.Get(), zero);
+    ID3D11ShaderResourceView* srvs[2] = {a, b};
+    ID3D11UnorderedAccessView* uavs[1] = {colorHistogramUav.Get()};
+    ctx->CSSetShader(csColorHistogram.Get(), nullptr, 0);
+    ctx->CSSetShaderResources(0, 2, srvs);
+    ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+    ctx->Dispatch(DivUp(histW, 8), DivUp(histH, 8), 1);
+    ID3D11ShaderResourceView* none[2] = {};
+    ID3D11UnorderedAccessView* noUav[1] = {};
+    ctx->CSSetUnorderedAccessViews(0, 1, noUav, nullptr);
+    ctx->CSSetShaderResources(0, 2, none);
+}
+
+void Synth::Impl::RunCutDecide(bool blockFallback) {
+    if (!csCutDecide || !cut1Uav || !histTex[0] || !histSpatialTex || !cutSum || !cutPrevious) return;
     D3D11_MAPPED_SUBRESOURCE m{};
     if (SUCCEEDED(ctx->Map(cbMc.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         McCb c{};
-        c.lambda = kCutHist0;
-        c.magCap = kCutHist1;
-        c.magPrior = kCutRes0;
-        c.pad3 = kCutRes1;
-        c.anchor = kCutHard0;
-        c.reanchor = kCutHard1;
+        c.gridW = gridW;
+        c.gridH = gridH;
+        c.lambda = kCutFade;
+        c.anchor = kCutHard;
+        c.pad4[0] = kCutSpatialHard;
+        c.useIn = blockFallback ? 1U : 0U;
+        c.stepLvl = static_cast<float>(histW * histH);
         c.hintW = histTopMip;
-        c.hintH = cutTopMip;
         memcpy(m.pData, &c, sizeof(c));
         ctx->Unmap(cbMc.Get(), 0);
     }
-    ID3D11ShaderResourceView* srvs[5] = {histSrv[0].Get(), histSrv[1].Get(), histSrv[2].Get(), histSrv[3].Get(),
-                                         cutSrvAll.Get()};
+    ID3D11ShaderResourceView* srvs[8] = {histSrv[0].Get(), histSrv[1].Get(), histSrv[2].Get(), histSrv[3].Get(),
+                                     cutSumSrv.Get(), histSpatialSrv.Get(), cutPreviousSrv.Get(), colorHistogramSrv.Get()};
     ID3D11UnorderedAccessView* uavs[1] = {cut1Uav.Get()};
     ID3D11Buffer* cbs[1] = {cbMc.Get()};
     ctx->CSSetShader(csCutDecide.Get(), nullptr, 0);
-    ctx->CSSetShaderResources(10, 5, srvs);
+    ctx->CSSetShaderResources(10, 8, srvs);
     ctx->CSSetConstantBuffers(2, 1, cbs);
     ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
     ctx->Dispatch(1, 1, 1);
     ID3D11UnorderedAccessView* noUav[1] = {nullptr};
     ctx->CSSetUnorderedAccessViews(0, 1, noUav, nullptr);
-    ID3D11ShaderResourceView* noSrv[5] = {};
-    ctx->CSSetShaderResources(10, 5, noSrv);
+    ID3D11ShaderResourceView* noSrv[8] = {};
+    ctx->CSSetShaderResources(10, 8, noSrv);
+    ctx->CopyResource(cutPrevious.Get(), cutSum.Get());
 }
 
-void Synth::Impl::UpdateCut(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b) {
-    // DEBUG (env NSP_CUT_STATS): calibration readout - the raw residual's share above
-    // several bands, then the share the warp actually receives. Blocking; offline only.
+void Synth::Impl::UpdateCut(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b, bool blockFallback) {
+    RunCutStat(blockFallback);
+    // DEBUG (env NSP_CUT_STATS): calibration readout - each residual's mean and its share
+    // above several bands. Blocking; offline only.
     static const bool kCutStats = EnvSet("NSP_CUT_STATS");
     if (kCutStats && cutTex) {
-        RunCutStat(true);
         D3D11_TEXTURE2D_DESC td = {};
         cutTex->GetDesc(&td);
         td.MipLevels = 1;
@@ -1708,30 +1919,33 @@ void Synth::Impl::UpdateCut(ID3D11ShaderResourceView* a, ID3D11ShaderResourceVie
             D3D11_MAPPED_SUBRESOURCE m{};
             if (SUCCEEDED(ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m))) {
                 static const float kBands[] = {0.02f, 0.04f, 0.06f, 0.08f, 0.10f, 0.14f, 0.20f};
-                size_t counts[7] = {};
-                double sum = 0.0;
-                size_t cells = 0;
-                for (UINT y = 0; y < td.Height; ++y) {
-                    const auto* row = static_cast<const uint16_t*>(m.pData) + (y * m.RowPitch) / 2;
-                    for (UINT x = 0; x < td.Width; ++x) {
-                        const float r = HalfToFloat(row[x]);
-                        sum += r;
-                        ++cells;
-                        for (int k = 0; k < 7; ++k)
-                            if (r > kBands[k]) ++counts[k];
+                for (UINT channel = 0; channel < 2; ++channel) {
+                    size_t counts[7] = {};
+                    double sum = 0.0;
+                    size_t cells = 0;
+                    for (UINT y = 0; y < td.Height; ++y) {
+                        const auto* row = static_cast<const uint16_t*>(m.pData) + (y * m.RowPitch) / 2;
+                        for (UINT x = 0; x < td.Width; ++x) {
+                            const float r = HalfToFloat(row[x * 2 + channel]);
+                            sum += r;
+                            ++cells;
+                            for (int k = 0; k < 7; ++k)
+                                if (r > kBands[k]) ++counts[k];
+                        }
                     }
+                    Log("%s mean %.4f | share r>.02 %.3f >.04 %.3f >.06 %.3f >.08 %.3f >.10 %.3f >.14 %.3f >.20 %.3f",
+                        channel ? "cutzero" : "cutstat",
+                        cells ? sum / cells : 0.0, counts[0] / double(cells), counts[1] / double(cells),
+                        counts[2] / double(cells), counts[3] / double(cells), counts[4] / double(cells),
+                        counts[5] / double(cells), counts[6] / double(cells));
                 }
                 ctx->Unmap(st.Get(), 0);
-                Log("cutstat mean %.4f | share r>.02 %.3f >.04 %.3f >.06 %.3f >.08 %.3f >.10 %.3f >.14 %.3f >.20 %.3f",
-                    cells ? sum / cells : 0.0, counts[0] / double(cells), counts[1] / double(cells),
-                    counts[2] / double(cells), counts[3] / double(cells), counts[4] / double(cells),
-                    counts[5] / double(cells), counts[6] / double(cells));
             }
         }
     }
-    RunCutStat(false);
     RunCutHist(a, b);
-    RunCutDecide();
+    RunColorHistogram(a, b);
+    RunCutDecide(blockFallback);
     if (kCutStats && histTex[0]) {
         // The two inputs of the decision as the GPU saw them.
         double hist = 0.0;
@@ -1773,6 +1987,36 @@ void Synth::Impl::UpdateCut(ID3D11ShaderResourceView* a, ID3D11ShaderResourceVie
                 Log("cutshare %.4f %.4f", HalfToFloat(px[0]), HalfToFloat(px[1]));
                 ctx->Unmap(st.Get(), 0);
             }
+        }
+    }
+    if (kCutStats && histSpatialTex) {
+        D3D11_TEXTURE2D_DESC src = {};
+        histSpatialTex->GetDesc(&src);
+        D3D11_TEXTURE2D_DESC td = src;
+        td.Width = 1;
+        td.Height = 1;
+        td.MipLevels = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.BindFlags = 0;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        td.MiscFlags = 0;
+        ComPtr<ID3D11Texture2D> st;
+        if (SUCCEEDED(device->CreateTexture2D(&td, nullptr, st.GetAddressOf()))) {
+            for (UINT slice = 0; slice < src.ArraySize; ++slice) {
+                const UINT from = D3D11CalcSubresource(histTopMip, slice, src.MipLevels);
+                const UINT to = D3D11CalcSubresource(0, slice, 1);
+                ctx->CopySubresourceRegion(st.Get(), to, 0, 0, 0, histSpatialTex.Get(), from, nullptr);
+            }
+            double spatial = 0.0;
+            for (UINT slice = 0; slice < src.ArraySize; ++slice) {
+                D3D11_MAPPED_SUBRESOURCE m{};
+                if (SUCCEEDED(ctx->Map(st.Get(), slice, D3D11_MAP_READ, 0, &m))) {
+                    const auto* px = static_cast<const uint16_t*>(m.pData);
+                    for (int k = 0; k < 4; ++k) spatial += std::fabs(HalfToFloat(px[k]));
+                    ctx->Unmap(st.Get(), slice);
+                }
+            }
+            Log("cutspatial %.4f", 0.5 * spatial);
         }
     }
 }
@@ -1872,8 +2116,10 @@ bool Synth::Create(ID3D11Device* device, ID3D11DeviceContext* ctx, std::string* 
     if (!build("CSFillHint", "cs_5_0", csOut(&d.csFillHint))) return false;
     if (!build("CSCoarseFix", "cs_5_0", csOut(&d.csCoarseFix))) return false;
     if (!build("CSFieldCohere", "cs_5_0", csOut(&d.csFieldCohere))) return false;
+    if (!build("CSFieldVisibility", "cs_5_0", csOut(&d.csFieldVisibility))) return false;
     if (!build("CSCutResidual", "cs_5_0", csOut(&d.csCutResidual))) return false;
     if (!build("CSCutHist", "cs_5_0", csOut(&d.csCutHist))) return false;
+    if (!build("CSColorHistogram", "cs_5_0", csOut(&d.csColorHistogram))) return false;
     if (!build("CSCutDecide", "cs_5_0", csOut(&d.csCutDecide))) return false;
 
     // Point for the 1:1 paths (I13: nothing is scaled), linear for the warped
@@ -2252,23 +2498,16 @@ bool Synth::Resize(UINT w, UINT h, std::string* err, UINT cellPx) {
         D3D11_TEXTURE2D_DESC td = {};
         td.Width = d.gridW;
         td.Height = d.gridH;
-        td.MipLevels = 0;
+        td.MipLevels = 1;
         td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_R16_FLOAT;
+        td.Format = DXGI_FORMAT_R16G16_FLOAT;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET;
-        td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+        td.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
         HRESULT hr = d.device->CreateTexture2D(&td, nullptr, d.cutTex.ReleaseAndGetAddressOf());
         if (SUCCEEDED(hr)) {
-            D3D11_TEXTURE2D_DESC got = {};
-            d.cutTex->GetDesc(&got);
-            d.cutTopMip = got.MipLevels - 1;
-            hr = d.device->CreateShaderResourceView(d.cutTex.Get(), nullptr, d.cutSrvAll.ReleaseAndGetAddressOf());
-        }
-        if (SUCCEEDED(hr)) {
             D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
-            ud.Format = DXGI_FORMAT_R16_FLOAT;
+            ud.Format = DXGI_FORMAT_R16G16_FLOAT;
             ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
             ud.Texture2D.MipSlice = 0;
             hr = d.device->CreateUnorderedAccessView(d.cutTex.Get(), &ud, d.cutUav.ReleaseAndGetAddressOf());
@@ -2291,6 +2530,35 @@ bool Synth::Resize(UINT w, UINT h, std::string* err, UINT cellPx) {
         if (SUCCEEDED(hr)) hr = d.device->CreateTexture2D(&one, &init, d.heldCut1.ReleaseAndGetAddressOf());
         if (SUCCEEDED(hr))
             hr = d.device->CreateShaderResourceView(d.heldCut1.Get(), nullptr, d.heldCut1Srv.ReleaseAndGetAddressOf());
+        D3D11_BUFFER_DESC sums = {};
+        sums.ByteWidth = 12;
+        sums.Usage = D3D11_USAGE_DEFAULT;
+        sums.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        sums.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sumView = {};
+        sumView.Format = DXGI_FORMAT_R32_TYPELESS;
+        sumView.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+        sumView.BufferEx.NumElements = 3;
+        sumView.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC sumUav = {};
+        sumUav.Format = DXGI_FORMAT_R32_TYPELESS;
+        sumUav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        sumUav.Buffer.NumElements = 3;
+        sumUav.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+        const uint32_t noSums[3] = {};
+        D3D11_SUBRESOURCE_DATA sumsInit = {noSums, sizeof(noSums), 0};
+        if (SUCCEEDED(hr)) hr = d.device->CreateBuffer(&sums, &sumsInit, d.cutSum.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(hr)) hr = d.device->CreateShaderResourceView(d.cutSum.Get(), &sumView, d.cutSumSrv.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(hr)) hr = d.device->CreateUnorderedAccessView(d.cutSum.Get(), &sumUav, d.cutSumUav.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(hr)) hr = d.device->CreateBuffer(&sums, &sumsInit, d.cutPrevious.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(hr)) hr = d.device->CreateShaderResourceView(d.cutPrevious.Get(), &sumView, d.cutPreviousSrv.ReleaseAndGetAddressOf());
+        D3D11_BUFFER_DESC colorDesc = sums;
+        colorDesc.ByteWidth = 512 * 4;
+        sumView.BufferEx.NumElements = 512;
+        sumUav.Buffer.NumElements = 512;
+        if (SUCCEEDED(hr)) hr = d.device->CreateBuffer(&colorDesc, nullptr, d.colorHistogramBuffer.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(hr)) hr = d.device->CreateShaderResourceView(d.colorHistogramBuffer.Get(), &sumView, d.colorHistogramSrv.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(hr)) hr = d.device->CreateUnorderedAccessView(d.colorHistogramBuffer.Get(), &sumUav, d.colorHistogramUav.ReleaseAndGetAddressOf());
         d.histW = DivUp(d.srcW, 8);
         d.histH = DivUp(d.srcH, 8);
         for (int i = 0; i < 4 && SUCCEEDED(hr); ++i) {
@@ -2317,6 +2585,40 @@ bool Synth::Resize(UINT w, UINT h, std::string* err, UINT cellPx) {
                 hu.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
                 hu.Texture2D.MipSlice = 0;
                 hr = d.device->CreateUnorderedAccessView(d.histTex[i].Get(), &hu, d.histUav[i].ReleaseAndGetAddressOf());
+            }
+        }
+        if (SUCCEEDED(hr)) {
+            D3D11_TEXTURE2D_DESC sh = {};
+            sh.Width = d.histW;
+            sh.Height = d.histH;
+            sh.MipLevels = 0;
+            sh.ArraySize = 16;
+            sh.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            sh.SampleDesc.Count = 1;
+            sh.Usage = D3D11_USAGE_DEFAULT;
+            sh.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET;
+            sh.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+            hr = d.device->CreateTexture2D(&sh, nullptr, d.histSpatialTex.ReleaseAndGetAddressOf());
+            if (SUCCEEDED(hr)) {
+                D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+                sv.Format = sh.Format;
+                sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+                sv.Texture2DArray.MostDetailedMip = 0;
+                sv.Texture2DArray.MipLevels = UINT(-1);
+                sv.Texture2DArray.FirstArraySlice = 0;
+                sv.Texture2DArray.ArraySize = 16;
+                hr = d.device->CreateShaderResourceView(d.histSpatialTex.Get(), &sv,
+                                                        d.histSpatialSrv.ReleaseAndGetAddressOf());
+            }
+            if (SUCCEEDED(hr)) {
+                D3D11_UNORDERED_ACCESS_VIEW_DESC uv = {};
+                uv.Format = sh.Format;
+                uv.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+                uv.Texture2DArray.MipSlice = 0;
+                uv.Texture2DArray.FirstArraySlice = 0;
+                uv.Texture2DArray.ArraySize = 16;
+                hr = d.device->CreateUnorderedAccessView(d.histSpatialTex.Get(), &uv,
+                                                         d.histSpatialUav.ReleaseAndGetAddressOf());
             }
         }
         if (FAILED(hr)) {
@@ -2660,11 +2962,16 @@ bool Synth::PrepareMotion(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView*
 
         lumaFull(a, d.ofa.InputPrevUav());
         lumaFull(b, d.ofa.InputNextUav());
+
+
+
         // NVOFA reads the textures on its own engine, so the writes above have
         // to be submitted before Execute rather than sit in the context.
         d.ctx->Flush();
 
         if (d.ofa.Execute()) {
+
+
             // One Execute produced both directions. Converting each into our
             // field format costs a dispatch over the grid — nothing next to the
             // flow itself — and the backward one is negated on the way in so
@@ -2714,6 +3021,7 @@ bool Synth::PrepareMotion(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView*
             const bool kHashFields = !hashWhat.empty();
             std::string hashLog;
             flowToField(d.ofa.FlowFwdSrv(), 0, 1.0f);
+
             // G53: without a wait here, which of NVOFA's writes the passes below
             // see depends on GPU timing — up to 1 code level in a few pixels, run to
             // run, once the field coherence pass is in. The offline instrument
@@ -2744,6 +3052,7 @@ bool Synth::PrepareMotion(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView*
             d.RunFieldFix(0, 1, 0.5f, 0.5f);
             if (hMid) hashLog += " fix=" + d.HashTex(d.mv[1].Get());
             d.RunSmoothPass(1, 2);
+
             if (hPre) hashLog += " pre=" + d.HashTex(d.mv[2].Get());
             // FIELD COHERENCE (P21, G50). NVOFA's field is incoherent on fast,
             // blurred texture, and the warp's per-pixel candidates are drawn from
@@ -2764,23 +3073,32 @@ bool Synth::PrepareMotion(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView*
             }
             d.mvFinal = 2;
 
+
             const bool wantSides = d.occMode > 0 && d.ofa.FlowBwdSrv() != nullptr;
             if (wantSides) {
                 d.RunFieldFix(0, 1, 0.0f, 0.0f);
                 d.RunSmoothPass(1, 3);
+
                 if (d.fieldLab != 0) d.ApplyFieldLab(3, 0.0f, true);
+                else if (d.fieldCohere) d.RunCohere(3, 0.0f, 2, 0.05f, 8.0f, true, 2, true);
                 flowToField(d.ofa.FlowBwdSrv(), 0, -1.0f);
+
                 d.RunFieldFix(0, 1, 1.0f, 0.0f);
                 d.RunSmoothPass(1, 4);
+
                 if (d.fieldLab != 0) d.ApplyFieldLab(4, 1.0f, true);
+                else if (d.fieldCohere) d.RunCohere(4, 1.0f, 2, 0.05f, 8.0f, true, 2, true);
                 d.mvFwd = 3;
                 d.mvBwd = 4;
+
+
             } else {
                 d.mvFwd = -1;
                 d.mvBwd = -1;
             }
 
             d.UpdateCut(a, b);
+
             d.ctx->CSSetShader(nullptr, nullptr, 0);
             d.hasMotion = true;
             return true;
@@ -2919,14 +3237,13 @@ bool Synth::PrepareMotion(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView*
     runSmooth(0, 2);
 
     d.mvFinal = 2;
-    d.UpdateCut(a, b);
-    d.ctx->CSSetShader(nullptr, nullptr, 0);
-    // The matcher produces one field and no second opinion, so the occlusion
-    // test has to fall back to the self-consistency heuristic. Clearing these
-    // matters on the path where a hardware Execute failed mid-stream: the warp
-    // would otherwise read fields belonging to the previous pair.
+    // The matcher produces no source-anchored fields. Clear before UpdateCut
+    // too: after a failed Execute neither cut detection nor the warp may use
+    // fields belonging to the previous pair.
     d.mvFwd = -1;
     d.mvBwd = -1;
+    d.UpdateCut(a, b, true);
+    d.ctx->CSSetShader(nullptr, nullptr, 0);
     d.hasMotion = true;
     return true;
 }

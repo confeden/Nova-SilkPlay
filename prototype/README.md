@@ -156,11 +156,34 @@ rect around it ~12 times a second, a scroll as the whole page once.
 
 `tools/yt-check/windowed_check.py` runs the whole sequence - find, scroll, theater,
 pause/play, fullscreen and back - and compares the engine's rect with the page's own
-(`--local` uses `windowed_page.html`, a canvas-fed `<video>` with a sticky header and an
-optional glow, no network). On YouTube (light theme) and on the local page the rect
+(`--local` uses `windowed_page.html` with a sticky header and optional glow, no network).
+It defaults to fixed-timestamp WebM; `--local --fps 24` selects 24p (also accepts `30` or `60`),
+and `--source canvas` opts into the older RAF-paced diagnostic source. The JSON records the initial
+`requestVideoFrameCallback` display/media intervals for WebM, or canvas draw intervals for the
+diagnostic. In particular, 60p on a 60 Hz output takes the pass-through path and does not exercise
+P25 interpolation. Engine `out` is the rate of successful `Present` calls, not a physical scan-out
+measurement; when available, the stats also show DXGI's reported images and v-blank deltas. On
+YouTube (light theme) and on the local page the rect
 matched the page's to 1-2 px (the damage rect is the element rounded out), scrolls hid
 the overlay in 0.1 s and the video was found again in about 2 s. `tests/rectfind_test.cpp`
 replays the measured shapes (18 checks of behaviour).
+
+For the 30-minute windowed soak on monitor 2, `windowed_soak_page.py` accepts the same
+`--fps 24`, `--fps 30` or `--fps 60` rates. Start it with `--monitor 2 --out <ABS dir>`, then run
+`tools/soak/soak.py --minutes 30 --no-page --target-title "NSP windowed page" `
+`--windowed-auto --fps <same rate>`. The page runner uses CDP for its scroll cycles;
+it does not move the pointer or activate the Chrome window.
+
+Scouting and capture share an engine-owned `CaptureRuntime`: one item/Closed handler per live
+window and one successful Borderless grant, rather than recreating broker objects on every
+scroll. The dev OS retained broker handles per repeated target/access call; session and GPU
+resources still close on disengagement. Fault recovery discards the cached runtime too.
+
+Soak resource slopes use settled engaged samples; teardown/scout dips must not hide growth.
+The page runner verifies physical monitor bounds and supports `--stop-file <path>` for cleanup.
+For isolation, build `tools\soak\build_resource_cycle.cmd`, then run
+`tools\soak\resource_cycle.exe scout <test HWND> 60` (or `capture`, `device`, `overlay`, `ofa`).
+The probe requires the test page on a secondary monitor and keeps overlay windows hidden.
 
 ## Which captures are video frames
 
@@ -235,8 +258,7 @@ same clean way (the tray icon goes with it instead of lingering until hovered).
 
 ## Tray and Settings
 
-The version is `0.9.0-dev` — a development build of the first beta, 0.9 (D30) —
-shown by `--help`, in Settings with the commit it was built from (`+` = uncommitted
+The version is `0.9.0`, shown by `--help`, in Settings with the commit it was built from (`+` = uncommitted
 changes), and in the file's version resource.
 
 The tray icon is a **pink silk ribbon**, grey while frame generation is off
@@ -383,13 +405,14 @@ program. It creates a named manual-reset event instead, `Local\NovaSilkPlay.Quit
 setting it leaves the loop by the same path as Ctrl+Alt+X. The installer and
 `tools\soak` both use it.
 
-**Autostart** is an `HKCU\...\Run` value and is deliberately **not** in
-`settings.json`: a copy there would be a second source of truth that disagrees the
-moment the user disables the entry in Task Manager or the program is reinstalled
-elsewhere. The Settings switch reads the registry, writes it, and re-reads it — so a
-failed write or an entry disabled in Task Manager snaps the switch back to the truth
-instead of showing what was wished for. The program never creates the value on its
-own; it only repairs one that already exists and names the wrong path.
+**Autostart** is `Nova SilkPlay.lnk` in the current user's `FOLDERID_Startup`
+(normally `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`), deliberately
+absent from `settings.json`. Settings and Setup use the same shortcut. The app migrates
+an enabled legacy `HKCU\...\Run` registration, preserving its target if it still exists;
+it never registers itself just because it was launched. A working installed shortcut
+is never redirected to a development build. Task Manager disables are read from
+`StartupApproved\StartupFolder` and respected. A disabled legacy Run entry is kept
+until the user explicitly changes the option, avoiding an unintended re-enable.
 
 **The installer** is `installer\silkplay.iss`, built by `installer\build_installer.cmd`
 into `installer\out\`. Per-user (`PrivilegesRequired=lowest`), no elevation, into
@@ -468,8 +491,10 @@ be silently gated by a browser state it did not ask about.
   pixel to pixel. Measured against that version: spurious edges on real 1440p
   footage -67..-73 %, analytic scenes +1.05 / +4.08 / +3.36 dB (A1 / A3 / A4).
 
-  **Scene cuts** (P23): once per pair the GPU compares tone histograms of the two
-  frames and how much of the picture the field still cannot explain. A hard cut
+  **Scene cuts** (P23): once per pair the GPU compares global and four-quadrant
+  tone histograms of the two frames, plus how much of the picture the field still
+  cannot explain. The spatial histograms also catch a cut whose full-frame tone
+  distribution is unchanged. A hard cut
   holds the frame before it until the next one is due — the cut stays a cut
   instead of a mosaic of both shots — and a pair that is merely unexplainable
   (something sweeping in from off-frame) is cross-faded. No readback: the
@@ -618,6 +643,9 @@ sources, not an average of them.
 | `nsp_rectfind.*` | P11: `RectFinder` (which damage rect is the video) and `GeometryGuard` (may the overlay show on it now) - pure logic |
 | `nsp_mediawatch.*` | is a Chrome media session Playing, from Windows' media transport controls, on its own thread |
 | `tests/rectfind_test.cpp` | the finder and the guard on the damage shapes measured on windowed YouTube (`tests\build_rectfind_test.cmd`) |
+| `tests/cohere_test.cpp` | 144 deterministic GPU cases comparing reference coherence and visibility specialization, including zero photometric error (`tests\build_cohere_test.cmd`) |
+| `nsp_cadence.h`, `tests/cadence_test.cpp` | Source-period trimming; 1051 checks including 60 fps/165 Hz interval mixtures (`tests\build_cadence_test.cmd`) |
+| `tests/ofa_lifetime_test.cpp` | Six real GPU recreate/execute/destroy cycles: zero hints, no stale mode, bidirectional 8 px translation (`tests\build_ofa_lifetime_test.cmd`) |
 | `nsp_winwatch.*` | WinEvent hooks that re-run the occlusion test the moment windows change |
 | `nsp_tray.*` | the UI thread: the tray icon, its menu, and the mailbox between it and the engine |
 | `nsp_settings_window.*` | the Settings window (cards, owner-drawn switches, DPI changes, keyboard) |
@@ -667,3 +695,18 @@ time moved from the wall time between two presents, with presents where the
 source is holding still and restarts after a still counted apart — and a `capture:` line
 (video frames vs UI-only refreshes, content-test readback) and a `windows:` line
 (z-order corrections, occlusion tests and their cost, hit tests on the overlay).
+
+## Startup, windowed activation and visibility-field follow-up
+
+- Start with Windows uses a user Startup `.lnk`, shared with the installer;
+  `tests/build_autostart_test.cmd` exercises real ShellLink persistence using an
+  isolated directory and registry shim.
+- Finder and geometry guard coalesce only full-edge rectangular dirty strips;
+  `tests/rectfind_test.cpp` replays the owner's split video damage. Explicit ON
+  restarts scouting even without a system media session for up to 20 seconds.
+- A/B visibility fields now receive guarded coherence at their own anchors,
+  reducing large-error pixels on BBB by 27.4% over 31 midpoint pairs. This adds
+  per-source-pair GPU work; the per-output-frame shader is unchanged. A3 loses
+  0.21 dB overall; complete ambient/sidebar unions and live acceptance remain open.
+- License: GPL-3.0-only; see the repository LICENSE and THIRD_PARTY_NOTICES.md.
+  [Magpie source comparison](../docs/magpie-comparison.md) explains the transfer scope.

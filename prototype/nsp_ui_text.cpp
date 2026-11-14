@@ -27,7 +27,7 @@ constexpr Entry kText[] = {
     {L"Fullscreen and windowed video", L"Видео во весь экран и в окне"},
     {L"Players", L"Плееры"},
     {L"PotPlayer", L"PotPlayer"},
-    {L"Coming after the beta", L"Появится после бета-версии"},
+    {L"Coming in a future update", L"Появится в следующем обновлении"},
     {L"General", L"Общие"},
     {L"Start with Windows", L"Запускать вместе с Windows"},
     {L"Nova SilkPlay appears in the notification area at sign-in",

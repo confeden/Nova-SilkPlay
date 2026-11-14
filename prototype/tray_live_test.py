@@ -42,12 +42,19 @@ kernel32.CloseHandle.argtypes = [wt.HANDLE]
 EVENT_MODIFY_STATE = 0x0002
 
 
-def read_run_value():
-    """The HKCU Run value the autostart switch writes, or None."""
+def startup_shortcut_path():
+    path = ctypes.create_unicode_buffer(260)
+    hr = ctypes.windll.shell32.SHGetFolderPathW(None, 7, None, 0, path)
+    if hr < 0:
+        raise OSError(f"SHGetFolderPathW(CSIDL_STARTUP) failed: {hr:#x}")
+    return os.path.join(path.value, "Nova SilkPlay.lnk")
+
+
+def read_startup_shortcut():
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-            return winreg.QueryValueEx(k, RUN_VALUE)[0]
-    except OSError:
+        with open(startup_shortcut_path(), "rb") as f:
+            return f.read()
+    except FileNotFoundError:
         return None
 user32.FindWindowW.restype = wt.HWND
 user32.GetDlgItem.restype = wt.HWND
@@ -170,21 +177,19 @@ def run_a():
             time.sleep(0.6)
             check("counter off saved", read_json().get("general", {}).get("fpsCounter") is False, str(read_json()))
 
-            # AUTOSTART lives in the registry, never in settings.json - that is the whole
+            # AUTOSTART lives in the Startup shortcut, never in settings.json - that is the whole
             # point of the design, and a copy in the JSON would be a second source of truth.
             # The test leaves the machine as it found it: whatever the value was before, it is
             # restored at the end of this block.
-            had_autostart = read_run_value() is not None
+            had_autostart = read_startup_shortcut() is not None
             click(sw, ID_AUTOSTART)
             time.sleep(0.6)
-            check("autostart toggled in the registry", (read_run_value() is not None) != had_autostart,
-                  repr(read_run_value()))
+            check("autostart toggled in the Startup folder", (read_startup_shortcut() is not None) != had_autostart)
             check("autostart is NOT in settings.json",
                   "autostart" not in json.dumps(read_json()).lower(), str(read_json()))
             click(sw, ID_AUTOSTART)
             time.sleep(0.6)
-            check("autostart toggled back", (read_run_value() is not None) == had_autostart,
-                  repr(read_run_value()))
+            check("autostart toggled back", (read_startup_shortcut() is not None) == had_autostart)
 
             user32.SendMessageW(ctls[4], CB_SETCURSEL, 2, 0)
             user32.SendMessageW(sw, WM_COMMAND, (CBN_SELCHANGE << 16) | ID_LANGUAGE, ctls[4])
@@ -330,10 +335,32 @@ def main():
     if user32.FindWindowW("NovaSilkPlayTray", None):
         sys.exit("ABORT: silkplay.exe is already running (its tray window exists)")
     os.makedirs(TMP, exist_ok=True)
-    run_a()
-    run_b()
-    run_c()
-    run_d()
+    shortcut_before = read_startup_shortcut()
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            run_before = winreg.QueryValueEx(k, RUN_VALUE)
+    except FileNotFoundError:
+        run_before = None
+    try:
+        run_a()
+        run_b()
+        run_c()
+        run_d()
+    finally:
+        path = startup_shortcut_path()
+        if shortcut_before is not None:
+            with open(path, "wb") as f:
+                f.write(shortcut_before)
+        elif os.path.exists(path):
+            os.remove(path)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            if run_before is not None:
+                winreg.SetValueEx(k, RUN_VALUE, 0, run_before[1], run_before[0])
+            else:
+                try:
+                    winreg.DeleteValue(k, RUN_VALUE)
+                except FileNotFoundError:
+                    print("autostart: legacy Run value already absent during restore")
     print(f"\n{sum(results)}/{len(results)} passed (logs in {TMP})")
     return 0 if all(results) else 1
 

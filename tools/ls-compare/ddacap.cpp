@@ -14,6 +14,7 @@
 //   ddacap.exe --at X,Y --rect L,T,W,H --seconds S --out PREFIX
 //     --at     a desktop point on the monitor to record (physical px)
 //     --rect   crop in that monitor's coordinates (default: whole monitor)
+//     --defer-readback  preallocate crop textures and read only after capture
 //   writes PREFIX.raw (W*H*4 bytes per frame, BGRA, top-down) and PREFIX.csv
 
 #define WIN32_LEAN_AND_MEAN
@@ -55,9 +56,12 @@ int main(int argc, char** argv) {
     POINT at{0, 0};
     LONG cl = 0, ct = 0, cw = 0, ch = 0;
     double seconds = 3.0;
+    bool deferReadback = false;
     std::string out = "ddacap";
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--at") && i + 1 < argc) {
+        if (!strcmp(argv[i], "--defer-readback")) {
+            deferReadback = true;
+        } else if (!strcmp(argv[i], "--at") && i + 1 < argc) {
             sscanf_s(argv[++i], "%ld,%ld", &at.x, &at.y);
         } else if (!strcmp(argv[i], "--rect") && i + 1 < argc) {
             sscanf_s(argv[++i], "%ld,%ld,%ld,%ld", &cl, &ct, &cw, &ch);
@@ -131,14 +135,38 @@ int main(int argc, char** argv) {
     sd.SampleDesc.Count = 1;
     sd.Usage = D3D11_USAGE_STAGING;
     sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    const size_t frameBytes = static_cast<size_t>(cw) * ch * 4;
     ComPtr<ID3D11Texture2D> staging;
-    if (FAILED(dev->CreateTexture2D(&sd, nullptr, &staging))) return 3;
+    std::vector<ComPtr<ID3D11Texture2D>> deferred;
+    if (deferReadback) {
+        // Narrow cadence strips fit this bound; large film crops keep the
+        // ordinary path. No allocation, mapping or hashing in the acquire loop.
+        if (!(seconds > 0.0 && seconds <= 60.0)) return 3;
+        const size_t capacity = static_cast<size_t>(seconds * 360.0) + 32;
+        if (frameBytes > (512ull * 1024 * 1024) / capacity) {
+            fprintf(stderr, "deferred readback exceeds 512 MiB: reduce crop or duration\n");
+            return 3;
+        }
+        deferred.resize(capacity);
+        for (auto& texture : deferred) {
+            hr = dev->CreateTexture2D(&sd, nullptr, &texture);
+            if (FAILED(hr)) {
+                fprintf(stderr, "deferred texture allocation 0x%08lX\n", hr);
+                return 3;
+            }
+        }
+    } else if (FAILED(dev->CreateTexture2D(&sd, nullptr, &staging))) return 3;
 
     FILE* raw = nullptr;
     FILE* csv = nullptr;
     fopen_s(&raw, (out + ".raw").c_str(), "wb");
     fopen_s(&csv, (out + ".csv").c_str(), "w");
-    if (!raw || !csv) return 4;
+    if (!raw || !csv) {
+        fprintf(stderr, "could not open recording outputs\n");
+        if (raw) fclose(raw);
+        if (csv) fclose(csv);
+        return 4;
+    }
     fprintf(csv, "# monitor %ld,%ld %ldx%ld crop %ld,%ld %ldx%ld\n", mon.left, mon.top, monW, monH, cl,
             ct, cw, ch);
     fprintf(csv, "index,qpc_ms,last_present_qpc_ms,accumulated,hash\n");
@@ -149,7 +177,6 @@ int main(int argc, char** argv) {
     // In memory during the recording, to disk after it: writing 8 MB per frame
     // inside the loop capped the recorder near 22 frames a second and lost 176 of
     // LS's presents in 3 s (measured, first probe run).
-    const size_t frameBytes = static_cast<size_t>(cw) * ch * 4;
     struct Rec {
         double qpcMs, presentMs;
         UINT accumulated;
@@ -162,6 +189,7 @@ int main(int argc, char** argv) {
 
     const int64_t t0 = Qpc();
     uint64_t index = 0, missed = 0;
+    bool failed = false;
     while (toMs(Qpc() - t0) < seconds * 1000.0) {
         DXGI_OUTDUPL_FRAME_INFO fi{};
         ComPtr<IDXGIResource> res;
@@ -169,6 +197,7 @@ int main(int argc, char** argv) {
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
         if (FAILED(hr)) {
             fprintf(stderr, "AcquireNextFrame 0x%08lX\n", hr);
+            failed = true;
             break;
         }
         const int64_t acquired = Qpc();
@@ -177,9 +206,28 @@ int main(int argc, char** argv) {
             res.As(&tex);
             D3D11_BOX box{static_cast<UINT>(cl), static_cast<UINT>(ct), 0, static_cast<UINT>(cl + cw),
                           static_cast<UINT>(ct + ch), 1};
+            if (deferReadback) {
+                if (index >= deferred.size()) {
+                    fprintf(stderr, "deferred capture capacity exhausted; recording invalid\n");
+                    dup->ReleaseFrame();
+                    failed = true;
+                    break;
+                }
+                ctx->CopySubresourceRegion(deferred[static_cast<size_t>(index)].Get(),
+                                          0, 0, 0, 0, tex.Get(), 0, &box);
+                ctx->Flush();
+                if (fi.AccumulatedFrames > 1) missed += fi.AccumulatedFrames - 1;
+                recs.push_back({toMs(acquired), toMs(fi.LastPresentTime.QuadPart),
+                                fi.AccumulatedFrames, 0});
+                ++index;
+                worstWorkMs = (std::max)(worstWorkMs, toMs(Qpc() - acquired));
+                dup->ReleaseFrame();
+                continue;
+            }
             ctx->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, tex.Get(), 0, &box);
             D3D11_MAPPED_SUBRESOURCE m{};
-            if (SUCCEEDED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+            hr = ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m);
+            if (SUCCEEDED(hr)) {
                 std::vector<uint8_t> buf(frameBytes);
                 for (LONG y = 0; y < ch; ++y)
                     memcpy(buf.data() + static_cast<size_t>(y) * cw * 4,
@@ -192,19 +240,52 @@ int main(int argc, char** argv) {
                 frames.push_back(std::move(buf));
                 ++index;
                 worstWorkMs = (std::max)(worstWorkMs, toMs(Qpc() - acquired));
+            } else {
+                fprintf(stderr, "Map readback 0x%08lX\n", hr);
+                failed = true;
             }
         }
         dup->ReleaseFrame();
+        if (failed) break;
+    }
+    if (deferReadback) {
+        for (size_t i = 0; i < recs.size(); ++i) {
+            D3D11_MAPPED_SUBRESOURCE m{};
+            hr = ctx->Map(deferred[i].Get(), 0, D3D11_MAP_READ, 0, &m);
+            if (FAILED(hr)) {
+                fprintf(stderr, "deferred Map readback 0x%08lX\n", hr);
+                failed = true;
+                break;
+            }
+            std::vector<uint8_t> buf(frameBytes);
+            for (LONG y = 0; y < ch; ++y)
+                memcpy(buf.data() + static_cast<size_t>(y) * cw * 4,
+                       static_cast<uint8_t*>(m.pData) + static_cast<size_t>(y) * m.RowPitch,
+                       static_cast<size_t>(cw) * 4);
+            ctx->Unmap(deferred[i].Get(), 0);
+            recs[i].hash = Fnv1a(buf.data(), buf.size());
+            frames.push_back(std::move(buf));
+        }
     }
     for (size_t i = 0; i < frames.size(); ++i) {
-        fwrite(frames[i].data(), 1, frames[i].size(), raw);
-        fprintf(csv, "%zu,%.3f,%.3f,%u,%016llx\n", i, recs[i].qpcMs, recs[i].presentMs,
-                recs[i].accumulated, static_cast<unsigned long long>(recs[i].hash));
+        const size_t written = fwrite(frames[i].data(), 1, frames[i].size(), raw);
+        const int row = fprintf(csv, "%zu,%.3f,%.3f,%u,%016llx\n", i, recs[i].qpcMs,
+                                recs[i].presentMs, recs[i].accumulated,
+                                static_cast<unsigned long long>(recs[i].hash));
+        if (written != frames[i].size() || row < 0) {
+            fprintf(stderr, "recording write failed at frame %zu\n", i);
+            failed = true;
+            break;
+        }
     }
-    fclose(raw);
-    fclose(csv);
+    const int rawClose = fclose(raw);
+    const int csvClose = fclose(csv);
+    if (rawClose != 0 || csvClose != 0) {
+        fprintf(stderr, "recording close failed\n");
+        failed = true;
+    }
     printf("%llu frames in %.1f s, %llu coalesced presents (missed), %ldx%ld crop, worst per-frame work %.1f ms\n",
            static_cast<unsigned long long>(index), seconds, static_cast<unsigned long long>(missed), cw, ch,
            worstWorkMs);
-    return 0;
+    return failed ? 5 : 0;
 }

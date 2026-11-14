@@ -26,9 +26,16 @@ rem cannot un-steal a private key that was already read, and the owner's older s
 rem were resident at the time.
 rem
 rem Order matters: the exe is signed FIRST, because the installer embeds it byte for byte, and
-rem then ISCC signs setup.exe and the uninstaller through the SignTool directive.
+rem then the completed setup is signed. The uninstaller is not separately signed.
 set "NSP_SIGN="
 if /i "%~1"=="sign" set "NSP_SIGN=1"
+set "NSP_APP_VERSION="
+for /f "delims=" %%V in ('powershell.exe -NoProfile -Command "(Get-Item -LiteralPath '..\prototype\silkplay.exe').VersionInfo.ProductVersion"') do set "NSP_APP_VERSION=%%V"
+if not defined NSP_APP_VERSION (
+    echo FAILED: could not read the built application's version.
+    exit /b 1
+)
+set "NSP_SETUP=out\Nova.SilkPlay-%NSP_APP_VERSION%-setup.exe"
 
 if defined NSP_SIGN (
     call "%~dp0sign.cmd" "..\prototype\silkplay.exe"
@@ -37,16 +44,10 @@ if defined NSP_SIGN (
         exit /b 1
     )
 ) else (
-    echo NOTE: signing is OFF. Pass "sign" to sign the payload, the setup and the uninstaller.
+    echo NOTE: signing is OFF. Pass "sign" to sign the payload and the setup.
     echo       The setup this produces is UNSIGNED and SmartScreen will warn about it.
 )
 
-rem Inno runs the signer with CreateProcess, which cannot execute a .cmd - so this calls
-rem signtool.exe itself. The thumbprint and the switches MUST match sign.cmd; they are the same
-rem signature, applied to setup.exe and the uninstaller instead of to the payload.
-set "NSP_CERT=1C0316EB482013586C04FFAD05E50F800B9353E8"
-set "SIGNTOOL=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
-set "ISCC_ARGS="
 rem ISCC's own SignTool hook is NOT used, and the reason is worth keeping: the signer it
 rem runs is given the file WITHOUT quotes once the command reaches signtool through cmd, and
 rem this project's path has a space in it - signtool then received
@@ -61,12 +62,10 @@ if %errorlevel% neq 0 (
 )
 
 if defined NSP_SIGN (
-    for %%F in ("out\*-setup.exe") do (
-        call "%~dp0sign.cmd" "out\%%~nxF"
-        if errorlevel 1 (
-            echo FAILED: could not sign %%~nxF.
-            exit /b 1
-        )
+    call "%~dp0sign.cmd" "%NSP_SETUP%"
+    if errorlevel 1 (
+        echo FAILED: could not sign the current setup.
+        exit /b 1
     )
 )
 

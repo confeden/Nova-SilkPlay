@@ -19,6 +19,7 @@ import argparse
 import glob
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,7 +28,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ENGINE = os.path.normpath(os.path.join(HERE, "..", "prototype", "silkplay.exe"))
+ENGINE = os.environ.get("NSP_ENGINE") or os.path.normpath(os.path.join(HERE, "..", "prototype", "silkplay.exe"))
 
 
 def parse_one(part):
@@ -102,6 +103,122 @@ def spurious_edges(o, g, floor=8.0):
     """Mean excess edge strength (luma levels) and the share of pixels whose excess > 24."""
     ex = np.maximum(grad(luma(o)) - grad(luma(g)) - floor, 0.0)
     return float(ex.mean()), float((ex > 24.0).mean())
+
+
+def _run_gate_arm(frames, out, spec, motion_default="ofa"):
+    """Run one run_analytic.py-style arm on the decimated real-content frames."""
+    parts = spec.split(":")
+    if len(parts) < 2 or len(parts) > 5:
+        raise ValueError(f"bad arm {spec!r}: expected mode:motion[:occ][:labN[@p]][:fldN[@p]]")
+    mode, motion = parts[0], parts[1] or motion_default
+    occ = lab = fld = None
+    for extra in parts[2:]:
+        if extra.startswith("lab"):
+            lab = extra[3:]
+        elif extra.startswith("fld"):
+            fld = extra[3:]
+        else:
+            occ = extra
+    if mode == "oracle":
+        raise ValueError(f"real-content gate arm {spec!r} cannot use oracle fields")
+
+    hints = motion == "ofa+hints"
+    seed_hints = motion == "ofa+seedhints"
+    engine_motion = "ofa" if hints or seed_hints else motion
+    src = out + "_src"
+    shutil.rmtree(out, ignore_errors=True)
+    shutil.rmtree(src, ignore_errors=True)
+    os.makedirs(out)
+    os.makedirs(src)
+    try:
+        for k, frame in enumerate(frames):
+            shutil.copyfile(frame, os.path.join(src, f"{k:06d}.png"))
+        cmd = [ENGINE, "--offline", src, "--mode", mode, "--motion", engine_motion,
+               "--offline-out", out, "--offline-t", "0.5"]
+        if hints:
+            cmd += ["--ofa-hints"]
+        elif seed_hints:
+            cmd += ["--ofa-hints", "--ofa-seed-hints"]
+        elif engine_motion == "ofa":
+            cmd += ["--no-ofa-hints"]
+        if occ:
+            cmd += ["--occ", occ]
+        if lab:
+            lab_mode, _, lab_p = lab.partition("@")
+            cmd += ["--warp-lab", lab_mode]
+            if lab_p:
+                cmd += ["--warp-lab-p", lab_p]
+        if fld:
+            fld_mode, _, fld_p = fld.partition("@")
+            cmd += ["--field-lab", fld_mode]
+            if fld_p:
+                cmd += ["--field-lab-p", fld_p]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError(f"engine failed for {spec}: {result.stdout[-1200:]}{result.stderr[-1200:]}")
+        outputs = sorted(glob.glob(os.path.join(out, "pair*_t050.png")))
+        if len(outputs) != len(frames) - 1:
+            raise RuntimeError(f"{spec}: expected {len(frames) - 1} outputs, got {len(outputs)}")
+        return outputs
+    finally:
+        shutil.rmtree(src, ignore_errors=True)
+
+
+def score_gate_corpus(corpus, arms, out, *, stride=2, count=32, big=40):
+    """Score a fixed real-content clip for gate.py; return per-clip and per-pair metrics."""
+    if count < 2:
+        raise ValueError("real-content count must be at least 2 input frames")
+    all_frames = sorted(glob.glob(os.path.join(corpus, "*.png")))
+    if stride < 2 or stride % 2:
+        raise ValueError("real-content stride must be even and at least 2")
+    if len(all_frames) < stride + 1:
+        raise ValueError(f"not enough PNG frames in {corpus}")
+    input_indices = list(range(0, min(len(all_frames), (count - 1) * stride + 1), stride))
+    frames = [all_frames[i] for i in input_indices]
+    truths = [all_frames[i + stride // 2] for i in input_indices[:-1]]
+    if len(truths) != len(frames) - 1 or not truths:
+        raise ValueError(f"could not form exact midpoint pairs from {corpus}")
+
+    scored = {}
+    for spec in arms:
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", spec)
+        outputs = _run_gate_arm(frames, os.path.join(out, name), spec)
+        mse, big_px, npx, edge_means, edge_high = [], 0, 0, [], []
+        per_pair = []
+        for pair, (output_path, truth_path) in enumerate(zip(outputs, truths)):
+            image, truth = load(output_path), load(truth_path)
+            error = np.abs(image - truth)
+            pixel_error = error.max(axis=2)
+            pair_mse = float((error.astype(np.float64) ** 2).mean())
+            edge_mean, edge_high_share = spurious_edges(image, truth)
+            mse.append(pair_mse)
+            big_px += int((pixel_error > big).sum())
+            npx += pixel_error.size
+            edge_means.append(edge_mean)
+            edge_high.append(edge_high_share)
+            per_pair.append({
+                "pair": pair,
+                "psnr_db": float(10 * np.log10(255.0 ** 2 / max(pair_mse, 1e-9))),
+                "big_error_px_pct": float(100 * (pixel_error > big).mean()),
+                "spurious_edge_mean": edge_mean,
+                "spurious_edge_gt24_pct": float(100 * edge_high_share),
+            })
+        scored[spec] = {
+            "psnr_db": float(10 * np.log10(255.0 ** 2 / max(float(np.mean(mse)), 1e-9))),
+            "big_error_px_pct": float(100 * big_px / npx),
+            "spurious_edge_mean": float(np.mean(edge_means)),
+            "spurious_edge_gt24_pct": float(100 * np.mean(edge_high)),
+            "per_pair": per_pair,
+        }
+    return {
+        "corpus": os.path.basename(os.path.normpath(corpus)),
+        "stride": stride,
+        "pairs": len(truths),
+        "big_error_threshold": big,
+        "spurious_edge_floor_luma": 8.0,
+        "spurious_edge_hot_threshold": 24.0,
+        "arms": scored,
+    }
 
 
 def main():

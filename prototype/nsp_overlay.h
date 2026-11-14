@@ -17,6 +17,24 @@
 
 namespace nsp {
 
+struct OverlayMediaStats {
+    bool available = false;
+    uint64_t samples = 0;
+    uint64_t framesShown = 0;
+    uint64_t sameRefresh = 0;
+    uint64_t skippedRefreshes = 0;
+    uint64_t discontinuities = 0;
+    UINT lastPresentRefreshCount = 0;
+    UINT lastSyncRefreshCount = 0;
+};
+
+struct OverlayPresentTrace {
+    UINT submitted = 0, displayed = 0, refresh = 0;
+    int64_t syncQpc = 0;
+    HRESULT submittedHr = E_FAIL;
+    bool mediaValid = false;
+};
+
 class Overlay {
 public:
     Overlay();
@@ -59,14 +77,18 @@ public:
     // draining the capture queue instead of sleeping through it.
     bool WaitPresentable(DWORD timeoutMs);
 
-    // Hands out this frame's back buffer. Does NOT wait — call WaitPresentable
-    // first.
+    // Two queued frames avoid a second pacing stall after the compositor clock.
+    // Slower, rate-gated outputs keep one. Can change when the window moves.
+    bool SetFrameLatency(UINT frames);
+
+    // Hands out this frame's back buffer, waiting up to 12 ms for a queue slot.
     // Both pointers are BORROWED: valid until the next Present(). `rtvSrgb` writes
     // through an _SRGB view, so shaders work in linear light for free.
     bool AcquireBackBuffer(ID3D11Texture2D** tex, ID3D11RenderTargetView** rtvSrgb);
 
-    // Presents the acquired back buffer. Returns false only on device loss.
-    bool Present();
+    enum class PresentResult { Presented, Skipped, DeviceLost };
+    // A transient failure is not a successful present or a lost device.
+    PresentResult Present();
 
     void Show();
     void Hide();
@@ -75,6 +97,11 @@ public:
     // DXGI_FRAME_STATISTICS_MEDIA::CompositionMode of the last present:
     // 0 COMPOSED, 1 OVERLAY, 2 NONE, 3 FAILURE, -1 unavailable.
     int  LastCompositionMode() const;
+
+    // Drains DXGI media statistics accumulated since the previous call. These
+    // counts describe frames/v-blanks reported as shown, not calls to Present1.
+    OverlayMediaStats TakeMediaStats();
+    OverlayPresentTrace TracePresentation() const;
 
     const std::string& CreationReport() const;
 

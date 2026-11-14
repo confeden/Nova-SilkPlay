@@ -18,6 +18,7 @@ import argparse
 import ctypes
 import ctypes.wintypes as wt
 import json
+import math
 import os
 import subprocess
 import sys
@@ -31,6 +32,22 @@ cc = yc.cc
 user32 = yc.user32
 LS_EXE = r"D:\SteamLibrary\steamapps\common\Lossless Scaling\game\LosslessScaling.exe"
 VK_Q = 0x51
+
+
+def playable_state(state, min_width=1):
+    # YouTube replaces its <video> during fullscreen/navigation; STATE_JS then
+    # legitimately returns null fields. Wait for the new player, not None >= int.
+    if not isinstance(state, dict) or state.get("paused") is not False:
+        return False
+    for key in ("w", "t"):
+        value = state.get(key)
+        if type(value) not in (int, float) or not math.isfinite(value):
+            return False
+    return state["w"] >= min_width and state["t"] >= 0
+
+
+def media_time_reached(value, target):
+    return type(value) in (int, float) and math.isfinite(value) and value >= target
 
 
 def chord(*vks):
@@ -239,7 +256,7 @@ def _open_fullscreen(a, W, H, X, Y, sess, cdp):
     if not yc.js(cdp, sid, yc.PROBE_JS):
         raise RuntimeError("rVFC probe did not install")
     # Comparisons are only valid at the requested rendition (owner: 1440p sources).
-    if not yc.wait_for(lambda: (lambda st: st["w"] >= a.min_width and not st["paused"])(yc.js(cdp, sid, yc.STATE_JS)), 60, 0.5):
+    if not yc.wait_for(lambda: playable_state(yc.js(cdp, sid, yc.STATE_JS), a.min_width), 60, 0.5):
         raise RuntimeError(f"never reached {a.min_width} px wide: {yc.js(cdp, sid, yc.STATE_JS)}")
     return sess, cdp, sid, hwnd
 
@@ -257,13 +274,16 @@ def run_arm(arm, a, W, H, X=0, Y=0):
         time.sleep(3.0)  # controls fade after fullscreen
         if arm == "ours":
             elog = open(prefix + "_engine.log", "w", encoding="utf-8")
-            engine = subprocess.Popen([yc.ENGINE, "--default-settings"] + a.engine_args.split(), cwd=os.path.dirname(yc.ENGINE), stdout=elog,
+            browser_pid = wt.DWORD()
+            if not user32.GetWindowThreadProcessId(hwnd, ctypes.byref(browser_pid)) or not browser_pid.value:
+                raise RuntimeError("owned Chrome window disappeared before engine startup")
+            engine = subprocess.Popen([yc.ENGINE, "--default-settings", "--target-pid", str(browser_pid.value)] + a.engine_args.split(), cwd=os.path.dirname(yc.ENGINE), stdout=elog,
                                       stderr=subprocess.STDOUT)
             res["shown"] = bool(yc.wait_for(lambda: "overlay shown" in open(prefix + "_engine.log", encoding="utf-8",
                                                                              errors="replace").read(), 30, 0.25))
         elif arm == "ls":
             if not pids_of("LosslessScaling.exe"):
-                subprocess.Popen([LS_EXE], cwd=os.path.dirname(LS_EXE))
+                subprocess.Popen([a.ls_exe], cwd=os.path.dirname(a.ls_exe))
                 started_ls = True
                 yc.wait_for(lambda: windows_of(pids_of("LosslessScaling.exe")), 20, 0.5)
                 time.sleep(2.0)
@@ -279,13 +299,18 @@ def run_arm(arm, a, W, H, X=0, Y=0):
             if not out_win:
                 raise RuntimeError("Lossless Scaling did not put an output window over the primary")
         time.sleep(3.0)  # let the arm settle
-        st = yc.js(cdp, sid, yc.STATE_JS)
+        st = yc.wait_for(lambda: (lambda state: state if playable_state(state, a.min_width) else None)(
+            yc.js(cdp, sid, yc.STATE_JS)), 30)
+        if not st:
+            raise RuntimeError(f"video unavailable before recording: {yc.js(cdp, sid, yc.STATE_JS)}")
         res["state_before"] = st
         if st["t"] >= a.rec_at - 0.5:
             raise RuntimeError(f"media time {st['t']:.1f} already past --rec-at {a.rec_at}; use a later --rec-at")
         yc.js(cdp, sid, "window.__nsp.log = []; true")
-        yc.wait_for(lambda: yc.js(cdp, sid, "document.querySelector('video').currentTime") >= a.rec_at,
-                    a.rec_at - st["t"] + 30, 0.01)
+        if not yc.wait_for(lambda: media_time_reached(yc.js(cdp, sid,
+                    "document.querySelector('video')?.currentTime ?? null"), a.rec_at),
+                    a.rec_at - st["t"] + 30, 0.01):
+            raise RuntimeError(f"video never reached recording time {a.rec_at}: {yc.js(cdp, sid, yc.STATE_JS)}")
         res["media_at_record"] = yc.js(cdp, sid, "document.querySelector('video').currentTime")
         rec = subprocess.run([yc.DDACAP, "--at", f"{X + W // 2},{Y + H // 2}", "--rect", ",".join(map(str, rect)),
                               "--seconds", str(a.rec_seconds), "--out", prefix],
@@ -340,10 +365,12 @@ def main():
     ap.add_argument("--engine-args", default="", help="extra silkplay.exe arguments for the ours arm, e.g. '--warp-lab 22 --warp-lab-p 0.1'")
     ap.add_argument("--min-width", type=int, default=2560, help="an arm below this videoWidth is invalid")
     ap.add_argument("--profile")
+    ap.add_argument("--ls-exe", default=LS_EXE, help="LosslessScaling.exe to compare (resolve the owner's Startup shortcut first)")
     a = ap.parse_args()
+    a.out = os.path.abspath(a.out)
     a.crop = tuple(int(v) for v in a.crop.split(","))
     os.makedirs(a.out, exist_ok=True)
-    a.profile = a.profile or os.path.join(a.out, "chrome_profile")
+    a.profile = os.path.abspath(a.profile or os.path.join(a.out, "chrome_profile"))
     if pids_of("silkplay.exe"):
         sys.exit("silkplay.exe is already running; stop it first")
     mons = monitors()

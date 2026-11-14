@@ -382,7 +382,7 @@ bool SettingsWindow::OnCreate() {
     COLORREF caption = kBg;
     DwmSetWindowAttribute(hwnd_, DWMWA_CAPTION_COLOR, &caption, sizeof(caption));
 
-    // The registry is the autostart row's only source of truth, so read it before the first
+    // The Startup shortcut is the autostart row's source of truth, so read it before the first
     // paint: the window must open showing what is actually registered, not a remembered value.
     autostart_ = AutostartQuery();
 
@@ -579,7 +579,7 @@ void SettingsWindow::Paint(HDC hdc) {
 void SettingsWindow::DrawToggle(const DRAWITEMSTRUCT& dis) {
     const int row = static_cast<int>(dis.CtlID) - kCtlBase;
     const bool enabled = (dis.itemState & ODS_DISABLED) == 0;
-    // kAutostart reads the cached registry state, never Settings: kBlocked draws as off, because
+    // kAutostart reads the cached shell state, never Settings: kBlocked draws as off, because
     // off is what the shell will actually do with the entry.
     const bool on = enabled && (row == kChrome        ? s_.captureChrome
                                 : row == kAutostart   ? autostart_ == AutostartState::kOn

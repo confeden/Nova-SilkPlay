@@ -35,22 +35,22 @@ rem Timestamped, so the signature outlives the certificate. A signature without 
 rem verifying the day the certificate expires, which for a beta people keep around is not
 rem acceptable; if the timestamp server cannot be reached the signing FAILS rather than quietly
 rem producing a signature with a shelf life.
-"%SIGNTOOL%" sign /sha1 %NSP_CERT% /fd sha256 /td sha256 /tr http://timestamp.digicert.com "%~1"
+rem NSP_TIMESTAMP_RELAY=1 avoids WinHTTP connectivity failures without changing the machine's
+rem proxy settings. Python forwards the exact RFC3161 request to the real online authority.
+if defined NSP_TIMESTAMP_RELAY (
+    "%SIGNTOOL%" sign /sha1 %NSP_CERT% /fd sha256 "%~1"
+    if errorlevel 1 exit /b 1
+    python "%~dp0timestamp_relay.py" --signtool "%SIGNTOOL%" "%~1"
+) else (
+    "%SIGNTOOL%" sign /sha1 %NSP_CERT% /fd sha256 /tr http://timestamp.digicert.com /td sha256 "%~1"
+)
 if %errorlevel% neq 0 (
     echo FAILED: signtool could not sign "%~1".
     exit /b 1
 )
 
-"%SIGNTOOL%" verify /pa /v "%~1" >nul 2>&1
-if %errorlevel% neq 0 (
-    rem EXPECTED for a self-signed certificate: /pa checks the chain against the Authenticode
-    rem policy, and nothing outside this machine trusts our own root. Say so plainly instead of
-    rem letting it read as a failure - and say what it means for the user, because it is the
-    rem whole story of what this signature is and is not worth.
-    echo NOTE: the signature does not chain to a trusted root - expected for a self-signed
-    echo       certificate. It proves the file was not altered after WE built it; it does NOT
-    echo       satisfy SmartScreen, which will still warn on first run.
-)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0verify_signature.ps1" -Path "%~1" -Thumbprint "%NSP_CERT%"
+if errorlevel 1 exit /b 1
 echo SUCCESS: signed "%~1".
 endlocal
 rem EXPLICIT. `echo` does not clear errorlevel, so without this the script returns the

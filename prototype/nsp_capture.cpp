@@ -28,6 +28,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <memory>
+#include <map>
 
 namespace nsp {
 namespace {
@@ -179,7 +180,95 @@ HRESULT AwaitOperation(wf::IAsyncOperation<TResult> const& op, DWORD timeoutMs, 
 
 }  // namespace
 
+struct CaptureRuntime::Impl {
+    struct Target {
+        HWND hwnd = nullptr;
+        DWORD pid = 0;
+        wgc::GraphicsCaptureItem item{nullptr};
+        std::shared_ptr<std::atomic<bool>> closed = std::make_shared<std::atomic<bool>>(false);
+        winrt::event_token token{};
+        ~Target() {
+            if (item && token && !closed->load(std::memory_order_acquire) && IsWindow(hwnd)) {
+                try {
+                    item.Closed(token);
+                } catch (winrt::hresult_error const& e) {
+                    LogErr("capture target: removing Closed handler failed %s", HrString(e.code()).c_str());
+                }
+            }
+        }
+    };
+    const DWORD ownerThread = GetCurrentThreadId();
+    bool borderlessAllowed = false;
+    std::map<HWND, std::unique_ptr<Target>> targets;
+
+    bool Item(HWND hwnd, wgc::GraphicsCaptureItem* item,
+              std::shared_ptr<std::atomic<bool>>* closed, std::string* error) {
+        if (GetCurrentThreadId() != ownerThread) {
+            *error = "CaptureRuntime used from a different thread";
+            return false;
+        }
+        for (auto it = targets.begin(); it != targets.end();) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(it->first, &pid);
+            if (it->second->closed->load(std::memory_order_acquire) || !IsWindow(it->first) ||
+                pid != it->second->pid)
+                it = targets.erase(it);
+            else
+                ++it;
+        }
+        auto it = targets.find(hwnd);
+        if (it == targets.end()) {
+            auto target = std::make_unique<Target>();
+            target->hwnd = hwnd;
+            if (!GetWindowThreadProcessId(hwnd, &target->pid)) {
+                *error = "capture target window disappeared";
+                return false;
+            }
+            try {
+                auto factory = winrt::get_activation_factory<wgc::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+                winrt::check_hresult(factory->CreateForWindow(hwnd, winrt::guid_of<wgc::GraphicsCaptureItem>(),
+                                                              winrt::put_abi(target->item)));
+                if (!target->item) {
+                    *error = "CreateForWindow returned no capture item";
+                    return false;
+                }
+                auto flag = target->closed;
+                target->token = target->item.Closed([flag](auto const&, auto const&) {
+                    flag->store(true, std::memory_order_release);
+                });
+            } catch (winrt::hresult_error const& e) {
+                *error = Fmt("capture target acquisition failed %s", HrString(e.code()).c_str());
+                return false;
+            }
+            it = targets.emplace(hwnd, std::move(target)).first;
+        }
+        *item = it->second->item;
+        *closed = it->second->closed;
+        return true;
+    }
+
+    HRESULT Borderless(wacc::AppCapabilityAccessStatus* status) {
+        if (GetCurrentThreadId() != ownerThread) return E_UNEXPECTED;
+        if (borderlessAllowed) {
+            *status = wacc::AppCapabilityAccessStatus::Allowed;
+            return S_OK;
+        }
+        try {
+            auto op = wgc::GraphicsCaptureAccess::RequestAccessAsync(wgc::GraphicsCaptureAccessKind::Borderless);
+            const HRESULT hr = AwaitOperation(op, kAccessRequestTimeoutMs, status);
+            if (SUCCEEDED(hr) && *status == wacc::AppCapabilityAccessStatus::Allowed) borderlessAllowed = true;
+            return hr;
+        } catch (winrt::hresult_error const& e) {
+            return e.code();
+        }
+    }
+};
+
+CaptureRuntime::CaptureRuntime() : impl_(std::make_unique<Impl>()) {}
+CaptureRuntime::~CaptureRuntime() = default;
+
 struct Capture::Impl {
+    std::shared_ptr<CaptureRuntime> runtime;
     ID3D11Device* device = nullptr;         // borrowed: owned by Overlay
     ID3D11DeviceContext* ctx = nullptr;     // borrowed
     // Five slots, five roles, and every change of role is an index shuffle — no
@@ -267,7 +356,6 @@ struct Capture::Impl {
     wgc::GraphicsCaptureItem item{nullptr};
     wgc::Direct3D11CaptureFramePool pool{nullptr};
     wgc::GraphicsCaptureSession session{nullptr};
-    winrt::event_token closedToken{};
     std::shared_ptr<std::atomic<bool>> itemClosed = std::make_shared<std::atomic<bool>>(false);
 
     std::vector<TimedDamage> damage;  // drained by TakeDamage (P11 geometry guard)
@@ -516,7 +604,9 @@ void Capture::Impl::Commit(bool advance, const char* why, int changed, const Cap
     }
 }
 
-Capture::Capture() : impl_(std::make_unique<Impl>()) {}
+Capture::Capture(std::shared_ptr<CaptureRuntime> runtime) : impl_(std::make_unique<Impl>()) {
+    impl_->runtime = runtime ? std::move(runtime) : std::make_shared<CaptureRuntime>();
+}
 Capture::~Capture() { Stop(); }
 
 const RECT& Capture::SourceRect() const { return impl_->srcRect; }
@@ -639,18 +729,8 @@ bool Capture::Start(ID3D11Device* device, ID3D11DeviceContext* ctx, HWND target,
     }
 
     // ---- the item
-    {
-        winrt::hresult_error factoryError{};
-        auto interop = winrt::try_get_activation_factory<wgc::GraphicsCaptureItem,
-                                                         ::IGraphicsCaptureItemInterop>(factoryError);
-        if (!interop)
-            return fail(Fmt("IGraphicsCaptureItemInterop activation failed: %s",
-                            HrString(factoryError.code()).c_str()));
-        const HRESULT hr = interop->CreateForWindow(target, winrt::guid_of<wgc::GraphicsCaptureItem>(),
-                                                    winrt::put_abi(s.item));
-        if (FAILED(hr) || !s.item)
-            return fail(Fmt("CreateForWindow failed: %s", HrString(hr).c_str()));
-    }
+    std::string itemError;
+    if (!s.runtime->impl_->Item(target, &s.item, &s.itemClosed, &itemError)) return fail(itemError);
 
     winrt::Windows::Graphics::SizeInt32 size{};
     try {
@@ -703,16 +783,9 @@ bool Capture::Start(ID3D11Device* device, ID3D11DeviceContext* ctx, HWND target,
     // unpackaged per-user process CAN drop the yellow capture border here.
     if (opt.tryBorderless) {
         auto status = wacc::AppCapabilityAccessStatus::DeniedBySystem;
-        HRESULT hr = E_FAIL;
-        try {
-            auto op = wgc::GraphicsCaptureAccess::RequestAccessAsync(
-                wgc::GraphicsCaptureAccessKind::Borderless);
-            hr = AwaitOperation(op, kAccessRequestTimeoutMs, &status);
-        } catch (winrt::hresult_error const& e) {
-            hr = e.code();
-        }
-        s.Add(SUCCEEDED(hr) ? Fmt("RequestAccessAsync(Borderless): %s", AccessStatusName(status))
-                            : Fmt("RequestAccessAsync(Borderless): FAILED %s", HrString(hr).c_str()));
+        const HRESULT hr = s.runtime->impl_->Borderless(&status);
+        s.Add(SUCCEEDED(hr) ? Fmt("Borderless access: %s", AccessStatusName(status))
+                            : Fmt("Borderless access: FAILED %s", HrString(hr).c_str()));
         try {
             s.session.IsBorderRequired(false);
             s.Add(Fmt("IsBorderRequired(false) -> readback %s",
@@ -749,16 +822,6 @@ bool Capture::Start(ID3D11Device* device, ID3D11DeviceContext* ctx, HWND target,
     } catch (winrt::hresult_error const& e) {
         s.Add(Fmt("MinUpdateInterval: THREW %s (G4 cap cannot be lifted)",
                   HrString(e.code()).c_str()));
-    }
-
-    try {
-        s.itemClosed = std::make_shared<std::atomic<bool>>(false);
-        auto flag = s.itemClosed;
-        s.closedToken = s.item.Closed([flag](wgc::GraphicsCaptureItem const&, wf::IInspectable const&) {
-            flag->store(true, std::memory_order_release);
-        });
-    } catch (winrt::hresult_error const& e) {
-        s.Add(Fmt("item.Closed registration THREW %s", HrString(e.code()).c_str()));
     }
 
     try {
@@ -990,13 +1053,6 @@ int Capture::Poll() {
 
 void Capture::Stop() {
     Impl& s = *impl_;
-    if (s.item && s.closedToken) {
-        try {
-            s.item.Closed(s.closedToken);
-        } catch (...) {
-        }
-        s.closedToken = {};
-    }
     if (s.session) {
         try {
             s.session.Close();
@@ -1031,25 +1087,27 @@ void Capture::Stop() {
     s.filled = 0;
     s.olderTime100ns = s.prevTime100ns = s.newestTime100ns = 0.0;
     s.started = false;
-    s.itemClosed->store(false, std::memory_order_release);
+    s.itemClosed.reset();
 }
 
 // ------------------------------------------------------------------ DamageScout
 
 struct DamageScout::Impl {
+    std::shared_ptr<CaptureRuntime> runtime;
     HWND target = nullptr;
     winrt::com_ptr<ID3D11Device> device;
     wgdx::Direct3D11::IDirect3DDevice rtDevice{nullptr};
     wgc::GraphicsCaptureItem item{nullptr};
     wgc::Direct3D11CaptureFramePool pool{nullptr};
     wgc::GraphicsCaptureSession session{nullptr};
-    winrt::event_token closedToken{};
     std::shared_ptr<std::atomic<bool>> itemClosed = std::make_shared<std::atomic<bool>>(false);
     LONG surfW = 0, surfH = 0;
     bool broken = false;
 };
 
-DamageScout::DamageScout() : impl_(std::make_unique<Impl>()) {}
+DamageScout::DamageScout(std::shared_ptr<CaptureRuntime> runtime) : impl_(std::make_unique<Impl>()) {
+    impl_->runtime = runtime ? std::move(runtime) : std::make_shared<CaptureRuntime>();
+}
 DamageScout::~DamageScout() { Stop(); }
 HWND DamageScout::Target() const { return impl_->target; }
 LONG DamageScout::SurfaceW() const { return impl_->surfW; }
@@ -1088,15 +1146,8 @@ bool DamageScout::Start(HWND target, std::string* err) {
             return fail(Fmt("IDirect3DDevice %s", HrString(e.code()).c_str()));
         }
     }
-    {
-        winrt::hresult_error factoryError{};
-        auto interop = winrt::try_get_activation_factory<wgc::GraphicsCaptureItem,
-                                                         ::IGraphicsCaptureItemInterop>(factoryError);
-        if (!interop) return fail("IGraphicsCaptureItemInterop unavailable");
-        hr = interop->CreateForWindow(target, winrt::guid_of<wgc::GraphicsCaptureItem>(),
-                                      winrt::put_abi(s.item));
-        if (FAILED(hr) || !s.item) return fail(Fmt("CreateForWindow %s", HrString(hr).c_str()));
-    }
+    std::string itemError;
+    if (!s.runtime->impl_->Item(target, &s.item, &s.itemClosed, &itemError)) return fail(itemError);
     winrt::Windows::Graphics::SizeInt32 size{};
     try {
         size = s.item.Size();
@@ -1114,8 +1165,8 @@ bool DamageScout::Start(HWND target, std::string* err) {
     // already (G14); asking again is answered from the cache.
     try {
         auto status = wacc::AppCapabilityAccessStatus::DeniedBySystem;
-        auto op = wgc::GraphicsCaptureAccess::RequestAccessAsync(wgc::GraphicsCaptureAccessKind::Borderless);
-        AwaitOperation(op, kAccessRequestTimeoutMs, &status);
+        hr = s.runtime->impl_->Borderless(&status);
+        if (FAILED(hr)) return fail(Fmt("borderless access %s", HrString(hr).c_str()));
         s.session.IsBorderRequired(false);
         if (s.session.IsBorderRequired()) return fail("the capture border cannot be turned off");
     } catch (winrt::hresult_error const& e) {
@@ -1133,10 +1184,6 @@ bool DamageScout::Start(HWND target, std::string* err) {
     } catch (winrt::hresult_error const&) {
     }
     try {
-        auto flag = s.itemClosed;
-        s.closedToken = s.item.Closed([flag](wgc::GraphicsCaptureItem const&, wf::IInspectable const&) {
-            flag->store(true, std::memory_order_release);
-        });
         s.session.StartCapture();
     } catch (winrt::hresult_error const& e) {
         return fail(Fmt("StartCapture %s", HrString(e.code()).c_str()));
@@ -1185,13 +1232,6 @@ bool DamageScout::Poll(std::vector<TimedDamage>* out) {
 
 void DamageScout::Stop() {
     Impl& s = *impl_;
-    if (s.item && s.closedToken) {
-        try {
-            s.item.Closed(s.closedToken);
-        } catch (...) {
-        }
-        s.closedToken = {};
-    }
     if (s.session) {
         try {
             s.session.Close();
@@ -1211,7 +1251,7 @@ void DamageScout::Stop() {
     s.device = nullptr;
     s.target = nullptr;
     s.surfW = s.surfH = 0;
-    s.itemClosed->store(false, std::memory_order_release);
+    s.itemClosed.reset();
 }
 
 }  // namespace nsp

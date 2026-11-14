@@ -108,6 +108,7 @@ struct Overlay::Impl {
     ComPtr<IDXGISwapChainMedia> media;
     HANDLE waitable = nullptr;
     UINT scW = 0, scH = 0;
+    UINT frameLatency = 0;
 
     HMODULE dcompDll = nullptr;
     ComPtr<IDCompositionDesktopDevice> dev;
@@ -124,6 +125,18 @@ struct Overlay::Impl {
     ComPtr<ID3D11RenderTargetView> backRtv;
 
     int lastCompositionMode = -1;
+    bool haveMediaStats = false;
+    UINT lastMediaPresentCount = 0;
+    UINT lastMediaPresentRefreshCount = 0;
+    uint64_t mediaSamples = 0;
+    uint64_t mediaFramesShown = 0;
+    uint64_t mediaSameRefresh = 0;
+    uint64_t mediaSkippedRefreshes = 0;
+    uint64_t mediaDiscontinuities = 0;
+    int64_t lastMediaQpc = 0;
+    int64_t lastMediaSyncQpc = 0;
+    double mediaMaxHz = 0.0;
+    UINT lastSyncRefreshCount = 0;
     HRESULT loggedPresentHr = S_OK;
     int presentFails = 0;       // consecutive failed Present1 calls
     int64_t lastDcompCheck = 0; // QPC of the last CheckDeviceState
@@ -148,6 +161,14 @@ bool Overlay::Impl::CreateSwapchain(UINT w, UINT h, std::string* err) {
 
     back.Reset();
     backRtv.Reset();
+    lastCompositionMode = -1;
+    haveMediaStats = false;
+    mediaSamples = mediaFramesShown = mediaSameRefresh = mediaSkippedRefreshes = 0;
+    mediaDiscontinuities = 0;
+    lastMediaQpc = 0;
+    lastMediaSyncQpc = 0;
+    mediaMaxHz = DesktopMaxRefreshHz();
+    lastMediaPresentCount = lastMediaPresentRefreshCount = lastSyncRefreshCount = 0;
 
     DXGI_SWAP_CHAIN_DESC1 scd = {};
     scd.Width = w;
@@ -167,6 +188,7 @@ bool Overlay::Impl::CreateSwapchain(UINT w, UINT h, std::string* err) {
 
     swap = sc;
     swap2.Reset();
+    frameLatency = 0;
     media.Reset();
     if (waitable) {
         CloseHandle(waitable);
@@ -176,6 +198,8 @@ bool Overlay::Impl::CreateSwapchain(UINT w, UINT h, std::string* err) {
         const HRESULT hrLat = swap2->SetMaximumFrameLatency(1);
         if (FAILED(hrLat))
             AppendFmt(report, "  SetMaximumFrameLatency(1) failed %s\n", HrString(hrLat).c_str());
+        else
+            frameLatency = 1;
         waitable = swap2->GetFrameLatencyWaitableObject();
     }
     if (FAILED(swap.As(&media)))
@@ -299,6 +323,32 @@ HWND Overlay::Hwnd() const { return impl_->hwnd; }
 const RECT& Overlay::VideoRect() const { return impl_->videoRect; }
 bool Overlay::IsShown() const { return impl_->shown; }
 int Overlay::LastCompositionMode() const { return impl_->lastCompositionMode; }
+OverlayPresentTrace Overlay::TracePresentation() const {
+    const Impl& d = *impl_;
+    OverlayPresentTrace out{};
+    if (d.swap) out.submittedHr = d.swap->GetLastPresentCount(&out.submitted);
+    out.displayed = d.lastMediaPresentCount;
+    out.refresh = d.lastMediaPresentRefreshCount;
+    out.syncQpc = d.lastMediaSyncQpc;
+    out.mediaValid = d.haveMediaStats;
+    return out;
+}
+
+OverlayMediaStats Overlay::TakeMediaStats() {
+    Impl& d = *impl_;
+    OverlayMediaStats out{};
+    out.available = d.media.Get() != nullptr;
+    out.samples = d.mediaSamples;
+    out.framesShown = d.mediaFramesShown;
+    out.sameRefresh = d.mediaSameRefresh;
+    out.skippedRefreshes = d.mediaSkippedRefreshes;
+    out.discontinuities = d.mediaDiscontinuities;
+    out.lastPresentRefreshCount = d.lastMediaPresentRefreshCount;
+    out.lastSyncRefreshCount = d.lastSyncRefreshCount;
+    d.mediaSamples = d.mediaFramesShown = d.mediaSameRefresh = d.mediaSkippedRefreshes = 0;
+    d.mediaDiscontinuities = 0;
+    return out;
+}
 const std::string& Overlay::CreationReport() const { return impl_->report; }
 uint32_t Overlay::HitTestsSeen() const { return g_hitTests.load(std::memory_order_relaxed); }
 uint64_t Overlay::ZOrderFixes() const { return impl_->zFixes; }
@@ -616,6 +666,23 @@ bool Overlay::WaitPresentable(DWORD timeoutMs) {
     return WaitForSingleObjectEx(d.waitable, timeoutMs, FALSE) == WAIT_OBJECT_0;
 }
 
+bool Overlay::SetFrameLatency(UINT frames) {
+    Impl& d = *impl_;
+    if (!d.swap2 || !d.waitable) {
+        LogErr("Overlay::SetFrameLatency: waitable swapchain unavailable");
+        return false;
+    }
+    if (d.frameLatency == frames) return true;
+    const HRESULT hr = d.swap2->SetMaximumFrameLatency(frames);
+    if (FAILED(hr)) {
+        LogErr("Overlay::SetFrameLatency(%u): %s", frames, HrString(hr).c_str());
+        return false;
+    }
+    d.frameLatency = frames;
+    Log("swapchain: maximum queued frames %u", frames);
+    return true;
+}
+
 bool Overlay::AcquireBackBuffer(ID3D11Texture2D** tex, ID3D11RenderTargetView** rtvSrgb) {
     Impl& d = *impl_;
     if (!d.swap) return false;
@@ -662,12 +729,14 @@ bool Overlay::AcquireBackBuffer(ID3D11Texture2D** tex, ID3D11RenderTargetView** 
     return true;
 }
 
-bool Overlay::Present() {
+Overlay::PresentResult Overlay::Present() {
     Impl& d = *impl_;
-    if (!d.swap) return false;
+    if (!d.swap) return PresentResult::DeviceLost;
 
     DXGI_PRESENT_PARAMETERS pp = {};
-    const HRESULT hr = d.swap->Present1(0, 0, &pp);
+    // Interval 0 can discard a queued frame after delayed motion work.
+    // Keep each image for at least one refresh (G119).
+    const HRESULT hr = d.swap->Present1(1, 0, &pp);
 
     // FLIP_DISCARD: buffer 0 is a different surface after every present.
     d.back.Reset();
@@ -676,7 +745,7 @@ bool Overlay::Present() {
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
         LogErr("Overlay::Present: %s, device removed reason %s", HrString(hr).c_str(),
                HrString(d.device ? d.device->GetDeviceRemovedReason() : hr).c_str());
-        return false;
+        return PresentResult::DeviceLost;
     }
     if (FAILED(hr)) {
         if (hr != d.loggedPresentHr) {
@@ -693,17 +762,51 @@ bool Overlay::Present() {
             LogErr("Overlay::Present: %d presents in a row failed - treating the device as lost",
                    d.presentFails);
             d.presentFails = 0;
-            return false;
+            return PresentResult::DeviceLost;
         }
-        return true;
+        return PresentResult::Skipped;
     }
     d.presentFails = 0;
     ++d.presents;
 
     if (d.media) {
         DXGI_FRAME_STATISTICS_MEDIA fsm = {};
-        if (SUCCEEDED(d.media->GetFrameStatisticsMedia(&fsm)))
+        if (SUCCEEDED(d.media->GetFrameStatisticsMedia(&fsm))) {
+            const int mode = static_cast<int>(fsm.CompositionMode);
+            const int64_t sampleQpc = QpcNow();
+            const UINT presentDelta = fsm.PresentCount - d.lastMediaPresentCount;
+            const UINT refreshDelta = fsm.PresentRefreshCount - d.lastMediaPresentRefreshCount;
+            // A mixed-refresh desktop can change the counters' origin when
+            // composition changes. Never turn a reset into billions of missed
+            // v-blanks. Allow one second of asynchronous statistics backlog;
+            // rejected spans are reported, not claimed as measured scan-out.
+            const double elapsed = d.lastMediaQpc ? QpcToSec(sampleQpc - d.lastMediaQpc) : 0.0;
+            const double maxDelta = (elapsed + 1.0) * (std::max)(1.0, d.mediaMaxHz) + 8.0;
+            const bool continuous = d.haveMediaStats && mode == d.lastCompositionMode &&
+                presentDelta <= maxDelta && refreshDelta <= maxDelta;
+            if (d.haveMediaStats && !continuous) ++d.mediaDiscontinuities;
             d.lastCompositionMode = static_cast<int>(fsm.CompositionMode);
+            // DXGI documents PresentCount as images actually shown and
+            // PresentRefreshCount as the v-blank where the latest image was
+            // shown; either can lag or repeat even while Present1 succeeds.
+            if (continuous) {
+                d.mediaFramesShown += presentDelta;
+                if (refreshDelta == 0)
+                    ++d.mediaSameRefresh;
+                else if (refreshDelta > 1)
+                    d.mediaSkippedRefreshes += refreshDelta - 1;
+            }
+            d.lastMediaPresentCount = fsm.PresentCount;
+            d.lastMediaPresentRefreshCount = fsm.PresentRefreshCount;
+            d.lastSyncRefreshCount = fsm.SyncRefreshCount;
+            d.lastMediaQpc = sampleQpc;
+            d.lastMediaSyncQpc = fsm.SyncQPCTime.QuadPart;
+            d.haveMediaStats = true;
+            ++d.mediaSamples;
+        } else {
+            if (d.haveMediaStats) ++d.mediaDiscontinuities;
+            d.haveMediaStats = false;
+        }
     }
 
     // IS ANYONE STILL COMPOSING WHAT WE PRESENT? A DWM restart or a display
@@ -733,11 +836,11 @@ bool Overlay::Present() {
                 LogErr("Overlay::Present: the DirectComposition device is no longer valid "
                        "(%s) - nothing we present is being composed, re-engaging",
                        HrString(ck).c_str());
-                return false;
+                return PresentResult::DeviceLost;
             }
         }
     }
-    return true;
+    return PresentResult::Presented;
 }
 
 }  // namespace nsp

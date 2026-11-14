@@ -1,6 +1,7 @@
 #include "nsp_rectfind.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <tuple>
@@ -33,6 +34,33 @@ bool Touches(const RECT& a, const RECT& b, LONG margin) {
 using RectKey = std::tuple<LONG, LONG, LONG, LONG>;
 RectKey Key(const RECT& r) { return {r.left, r.top, r.right, r.bottom}; }
 
+std::vector<std::pair<int, LONG>> SplitLines(const DamageSig& raw, const RECT& bounds) {
+    std::vector<std::pair<int, LONG>> lines;
+    for (int axis = 0; axis < 2; ++axis) {
+        const LONG low = axis ? bounds.left : bounds.top;
+        const LONG high = axis ? bounds.right : bounds.bottom;
+        for (int i = 0; i < raw.n; ++i) {
+            if (!Inside(raw.r[i], bounds, 0)) continue;
+            const LONG edges[2] = {axis ? raw.r[i].left : raw.r[i].top,
+                                   axis ? raw.r[i].right : raw.r[i].bottom};
+            for (const LONG edge : edges) {
+                if (edge <= low || edge >= high) continue;
+                bool crossed = false;
+                for (int j = 0; j < raw.n; ++j) {
+                    const RECT& r = raw.r[j];
+                    if (!Inside(r, bounds, 0)) continue;
+                    crossed = crossed || (axis ? r.left < edge && edge < r.right
+                                              : r.top < edge && edge < r.bottom);
+                }
+                const auto line = std::make_pair(axis, edge);
+                if (!crossed && std::find(lines.begin(), lines.end(), line) == lines.end())
+                    lines.push_back(line);
+            }
+        }
+    }
+    return lines;
+}
+
 }  // namespace
 
 bool DamageSig::Same(const DamageSig& o) const {
@@ -40,6 +68,35 @@ bool DamageSig::Same(const DamageSig& o) const {
     for (int i = 0; i < n; ++i)
         if (!SameRect(r[i], o.r[i])) return false;
     return true;
+}
+
+DamageSig DamageSig::Normalized() const {
+    DamageSig out = *this;
+    if (overflow) return out;
+    // Chrome can split one video repaint into horizontal/vertical strips beside an
+    // unrelated animation. Counting a strip as the video leaves a seam and the guard
+    // never sees it again. Join only exact rectangular unions, with no added pixels.
+    bool merged;
+    do {
+        merged = false;
+        for (int i = 0; i < out.n && !merged; ++i) {
+            for (int j = i + 1; j < out.n; ++j) {
+                const RECT a = out.r[i], b = out.r[j];
+                const bool vertical = a.left == b.left && a.right == b.right &&
+                                      a.top <= b.bottom && b.top <= a.bottom;
+                const bool horizontal = a.top == b.top && a.bottom == b.bottom &&
+                                        a.left <= b.right && b.left <= a.right;
+                if (!vertical && !horizontal) continue;
+                out.r[i] = RECT{(std::min)(a.left, b.left), (std::min)(a.top, b.top),
+                                (std::max)(a.right, b.right), (std::max)(a.bottom, b.bottom)};
+                for (int k = j + 1; k < out.n; ++k) out.r[k - 1] = out.r[k];
+                --out.n;
+                merged = true;
+                break;
+            }
+        }
+    } while (merged);
+    return out;
 }
 
 RECT DamageSig::Bounds() const {
@@ -81,16 +138,20 @@ std::string RectFinder::Summary(double tSec) const {
     return out.empty() ? std::string("no damage") : out;
 }
 
-void RectFinder::Reset(LONG surfaceW, LONG surfaceH, const RECT& viewport) {
+void RectFinder::Reset(LONG surfaceW, LONG surfaceH, const RECT& viewport, double expectedAspect,
+                       const RECT& reference) {
     surfW_ = surfaceW;
     surfH_ = surfaceH;
     viewport_ = viewport;
+    expectedAspect_ = expectedAspect;
+    reference_ = reference;
     hist_.clear();
 }
 
-void RectFinder::Add(double tSec, const DamageSig& d) {
+void RectFinder::Add(double tSec, const DamageSig& raw) {
+    const DamageSig d = raw.Normalized();
     if (d.n <= 0 && !d.overflow) return;  // a capture with no damage says nothing
-    hist_.push_back({tSec, d});
+    hist_.push_back({tSec, d, raw});
     const double keep = (std::max)(cfg_.companionSec, cfg_.windowSec + cfg_.minAgeSec);
     size_t drop = 0;
     while (drop < hist_.size() && hist_[drop].t < tSec - keep) ++drop;
@@ -102,6 +163,15 @@ bool RectFinder::Plausible(const RECT& r) const {
     if (w < cfg_.minW || h < cfg_.minH) return false;
     const double aspect = static_cast<double>(w) / h;
     if (aspect < cfg_.minAspect || aspect > cfg_.maxAspect) return false;
+    // A fixed page header can leave a plausible inner rect after scrolling.
+    if (expectedAspect_ > 0.0) {
+        const double expectedH = static_cast<double>(w) / expectedAspect_;
+        const bool centredFormat = W(reference_) > 0 && std::abs(w - W(reference_)) <= 2 &&
+            std::abs((r.left + r.right) - (reference_.left + reference_.right)) <= 4 &&
+            std::abs((r.top + r.bottom) - (reference_.top + reference_.bottom)) <= 4;
+        if (!centredFormat && std::abs(static_cast<double>(h) - expectedH) > (std::max)(3.0, 0.005 * expectedH))
+            return false;
+    }
     // The whole window repainting is a scroll, a resize or a page load, never a video in a
     // window; a video that fills the window is the fullscreen path's business.
     if (surfW_ > 0 && surfH_ > 0 && w >= surfW_ - 8 && h >= surfH_ - 8) return false;
@@ -112,17 +182,14 @@ bool RectFinder::Plausible(const RECT& r) const {
     if (vw > 0 && vh > 0 &&
         static_cast<double>(w) * h >= 0.9 * static_cast<double>(vw) * vh)
         return false;
-    // Nor a rect cut off by two PERPENDICULAR viewport edges. That is the shape of a glow
-    // painted around the picture and clipped by the page (YouTube's ambient mode: [1,95
-    // 1292x716], the viewport's top-left corner, header included). When the glow repaints in
-    // the same frame as the picture Chrome reports only their union, the picture's own rect
-    // never arrives, and the union is not the video: failing closed is the only honest answer
-    // (I10). The cost: a video scrolled half out of a viewport it also fills edge to edge
-    // (theater mode in a narrow window) is not generated until it is back in view.
+    // A vertically clipped repaint does not establish the video's geometry. Alloha can
+    // report an enlarged player/surround union ending at the page's bottom after a failed
+    // fullscreen transition (1132x676 on a 2560x1392 window). Accepting it puts the readout
+    // outside the picture. Wait until both vertical edges are in view (I10); horizontal
+    // edge-to-edge theater layouts remain eligible.
     if (vw > 0 && vh > 0) {
         const bool cutV = r.top <= viewport_.top + 1 || r.bottom >= viewport_.bottom - 1;
-        const bool cutH = r.left <= viewport_.left + 1 || r.right >= viewport_.right - 1;
-        if (cutV && cutH) return false;
+        if (cutV) return false;
     }
     return true;
 }
@@ -134,6 +201,12 @@ bool RectFinder::Found(double tSec, RECT* video, std::vector<DamageSig>* compani
         double first = 0.0;  // the earliest hit kept
         double last = 0.0;   // the latest
         RECT r{};
+        std::map<std::pair<int, LONG>, int> splits;
+        bool SplitEvidence(int witnesses) const {
+            for (const auto& split : splits)
+                if (recent - split.second < witnesses) return false;
+            return true;
+        }
     };
     std::map<RectKey, Hit> hits;
     for (const auto& e : hist_) {
@@ -151,7 +224,12 @@ bool RectFinder::Found(double tSec, RECT* video, std::vector<DamageSig>* compani
                 h.first = e.t;
                 h.r = e.d.r[i];
             }
-            if (e.t >= tSec - cfg_.windowSec) ++h.recent;
+            if (e.t >= tSec - cfg_.windowSec) {
+                ++h.recent;
+                // Stable full-edge subdivisions can be independent animations,
+                // not one video. Require repeated captures crossing each split.
+                for (const auto& split : SplitLines(e.raw, e.d.r[i])) ++h.splits[split];
+            }
             if (e.t >= tSec - cfg_.windowSec * 0.5) ++h.lastHalf;
             h.last = (std::max)(h.last, e.t);
         }
@@ -162,7 +240,8 @@ bool RectFinder::Found(double tSec, RECT* video, std::vector<DamageSig>* compani
         // Steady, not a burst: still arriving, and in both halves of the window.
         if (h.recent >= cfg_.minHits && h.first <= tSec - cfg_.minAgeSec &&
             h.last >= tSec - cfg_.maxSilenceSec && h.lastHalf * 4 >= cfg_.minHits &&
-            (h.recent - h.lastHalf) * 4 >= cfg_.minHits && Plausible(h.r))
+            (h.recent - h.lastHalf) * 4 >= cfg_.minHits && Plausible(h.r) &&
+            h.SplitEvidence(cfg_.minSplitWitnesses))
             cands.push_back(&h);
     }
     const Hit* best = nullptr;
@@ -182,7 +261,8 @@ bool RectFinder::Found(double tSec, RECT* video, std::vector<DamageSig>* compani
         for (const auto& kv : hits) {
             const Hit& o = kv.second;
             if (&o == hp || SameRect(o.r, h.r) || !Inside(o.r, h.r, 0)) continue;
-            if (o.recent * 2 < cfg_.minHits || !Plausible(o.r)) continue;
+            if (o.recent * 2 < cfg_.minHits || !Plausible(o.r) ||
+                !o.SplitEvidence(cfg_.minSplitWitnesses)) continue;
             if (static_cast<double>(W(o.r)) * H(o.r) < 0.35 * static_cast<double>(W(h.r)) * H(h.r))
                 continue;
             surround = true;
@@ -265,7 +345,8 @@ void GeometryGuard::MakeSuspect(double tSec, const char* why) {
     }
 }
 
-GeomVerdict GeometryGuard::Add(double tSec, const DamageSig& d) {
+GeomVerdict GeometryGuard::Add(double tSec, const DamageSig& raw) {
+    const DamageSig d = raw.Normalized();
     if (d.n <= 0 && !d.overflow) return GeomVerdict::kInside;  // no damage: nothing moved
     lastCapture_ = tSec;
     GeomVerdict v = GeomVerdict::kForeign;
@@ -277,7 +358,8 @@ GeomVerdict GeometryGuard::Add(double tSec, const DamageSig& d) {
         // few seconds, and judged as one shape it hid the overlay each time (2026-10-07).
         bool inside = true, exact = false;
         for (int k = 0; k < d.n; ++k) {
-            if (!Touches(d.r[k], video_, cfg_.exactTolPx)) continue;
+            // Dirty rects are half-open: sharing an edge repaints no video pixels.
+            if (!Touches(d.r[k], video_, 0)) continue;
             rel.r[rel.n++] = d.r[k];
             inside = inside && Inside(d.r[k], video_, cfg_.exactTolPx);
             exact = exact || Near(d.r[k], video_, cfg_.exactTolPx);
